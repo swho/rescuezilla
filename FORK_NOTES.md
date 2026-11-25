@@ -50,8 +50,10 @@ In full compliance with the upstream **GNU General Public License v3.0 or later
 
 ## Current Verification Status
 
-- **Verified**: Python unit tests, 3-process `Popen` + GNU `split` pipeline
-  tests, stock `gzip -d` / `zstd -d` decompression compatibility, and
-  end-to-end random-access reading with `rescuezilla-browser`.
-- **Not yet verified**: Full Debian package / bootable Live ISO build and
-  live bare-metal `BackupManager` run inside a Rescuezilla Live environment.
+- **Verified**:
+  - Python unit tests and 3-process `Popen` + GNU `split` pipeline tests (`test/test_seekable_compressor.py`).
+  - Full Ubuntu 24.04 (`noble`) Debian package + bootable Live ISO build via the upstream `Dockerfile` & `Makefile`.
+  - Live boot of the built ISO inside VMware Workstation (`26.0.1`), running real `rescuezillapy backup` (both `gzip` and `zstd` with 1 MiB frames) against a Debian 12 guest disk (`ext4` + `btrfs` + `vfat` + `bios_grub`), verifying `Info-seekidx-*.rzidx` generation across all 4 partitions.
+  - Full destructive wipe of the guest OS disk followed by live `rescuezillapy restore`, clean guest OS reboot, and 100% SHA-256 verification of all sentinel files & symlinks across `ext4`, `btrfs`, and `vfat`.
+  - End-to-end O(1) instant loading and 100% SHA-256 recovery of both the live `gzip` and `zstd` backup images in `rescuezilla-browser`.
+- **Not yet verified**: Physical bare-metal USB boot (including UEFI Secure Boot on physical firmware) and interactive GTK GUI wizard run (automated VM test exercised the shared `BackupManager`/`RestoreManager` backend via `rescuezillapy` CLI).

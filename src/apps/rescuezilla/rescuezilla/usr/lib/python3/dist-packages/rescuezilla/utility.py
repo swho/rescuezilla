@@ -957,7 +957,7 @@ class Utility:
         format,
         level_integer,
         index_output_path,
-        frame_size=16 * 1024 * 1024,
+        frame_size=1 * 1024 * 1024,
     ):
         """Return command list that produces RFC-compliant seekable gzip/zstd + .rzidx."""
         if format in ("gzip", "zstd"):

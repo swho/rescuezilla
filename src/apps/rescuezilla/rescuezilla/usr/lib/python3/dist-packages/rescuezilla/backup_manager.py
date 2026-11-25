@@ -2,6 +2,9 @@
 #   Copyright (C) 2012 RedoBackup.org
 #   Copyright (C) 2003-2025 Steven Shiau <steven _at_ clonezilla org>
 #   Copyright (C) 2019-2025 Rescuezilla.com <rescuezilla@gmail.com>
+#   Modified 2026-11-25 (Community Fork): Added seekable multi-frame
+#   compression and Info-seekidx-<part>.rzidx generation during backup
+#   (GPL-3.0-or-later).
 # ----------------------------------------------------------------------
 #   This program is free software: you can redistribute it and/or modify
 #   it under the terms of the GNU General Public License as published by
@@ -1363,9 +1366,27 @@ class BackupManager:
             # TODO: Simplify logic
             compression_format = self.compression_dict["format"]
             compression_suffix = Utility.get_compression_suffix(compression_format)
-            compression_cmd_list = Utility.get_compression_cmd_list(
-                compression_format, self.compression_dict["level"]
+            seekable_enabled = (
+                bool(self.compression_dict.get("seekable_index", True))
+                and os.environ.get("RESCUEZILLA_SEEKABLE_INDEX", "1") != "0"
+                and not self.is_cloning
+                and compression_format in ("gzip", "zstd")
             )
+            seekidx_path = None
+            if seekable_enabled:
+                seekidx_path = os.path.join(
+                    self.dest_dir,
+                    Utility.get_seekable_index_filename(short_device_node),
+                )
+                compression_cmd_list = Utility.get_seekable_compression_cmd_list(
+                    compression_format,
+                    self.compression_dict["level"],
+                    seekidx_path,
+                )
+            else:
+                compression_cmd_list = Utility.get_compression_cmd_list(
+                    compression_format, self.compression_dict["level"]
+                )
 
             split_size = "4GB"
             # Partclone dd blocksize (16MB)
@@ -1549,7 +1570,15 @@ class BackupManager:
                 # Workaround for Python3.7 process communicate() in while loop bug [1]
                 # [1] https://bugs.python.org/issue35182
                 self.logger.write("Exception during communicate:" + str(e))
-            if self.proc["partclone_backup_" + partition_key].returncode != 0:
+
+            # Ensure compression (including atomic .rzidx flush) and split finish cleanly
+            comp_rc = self.proc["compression_" + partition_key].wait()
+            split_rc = self.proc["split_" + partition_key].wait()
+            if (
+                self.proc["partclone_backup_" + partition_key].returncode != 0
+                or comp_rc != 0
+                or split_rc != 0
+            ):
                 partition_summary = (
                     _("<b>Failed to backup partition</b> {partition_name}").format(
                         partition_name=partition_key
@@ -1581,8 +1610,10 @@ class BackupManager:
                 self.ui_manager.display_error_message(
                     summary_message=partition_summary + extra_info
                 )
-                # Delete failed partclone files
+                # Delete failed partclone files (and any seek index file)
                 failed_partclone_img_path_list = glob.glob(filepath + "*")
+                if seekidx_path is not None:
+                    failed_partclone_img_path_list.extend(glob.glob(seekidx_path + "*"))
                 for file_path in failed_partclone_img_path_list:
                     try:
                         os.remove(file_path)

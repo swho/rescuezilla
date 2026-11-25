@@ -2,6 +2,8 @@
 #   Copyright (C) 2012 RedoBackup.org
 #   Copyright (C) 2003-2025 Steven Shiau <steven _at_ clonezilla org>
 #   Copyright (C) 2019-2025 Rescuezilla.com <rescuezilla@gmail.com>
+#   Modified 2026-11-25 (Community Fork): Added seekable multi-frame
+#   compression command helpers (GPL-3.0-or-later).
 # ----------------------------------------------------------------------
 #   This program is free software: you can redistribute it and/or modify
 #   it under the terms of the GNU General Public License as published by
@@ -24,6 +26,7 @@ import pwd
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -939,6 +942,42 @@ class Utility:
             return ["cat", "-"]
         else:
             raise ValueError("Unknown compression format: " + format)
+
+    @staticmethod
+    def get_seekable_index_filename(short_device_node):
+        """Return Clonezilla/Rescuezilla-safe metadata filename for the seek index.
+
+        Uses the `Info-*` prefix so stock Rescuezilla and Clonezilla restore globs
+        (`*-ptcl-img.*`) never treat the index file as an image split chunk.
+        """
+        return "Info-seekidx-" + short_device_node + ".rzidx"
+
+    @staticmethod
+    def get_seekable_compression_cmd_list(
+        format,
+        level_integer,
+        index_output_path,
+        frame_size=16 * 1024 * 1024,
+    ):
+        """Return command list that produces RFC-compliant seekable gzip/zstd + .rzidx."""
+        if format in ("gzip", "zstd"):
+            compressor_script = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "seekable_compressor.py",
+            )
+            return [
+                sys.executable,
+                compressor_script,
+                "--format",
+                format,
+                "--level",
+                str(level_integer),
+                "--frame-size",
+                str(frame_size),
+                "--index-output",
+                index_output_path,
+            ]
+        return Utility.get_compression_cmd_list(format, level_integer)
 
     @staticmethod
     def schedule_shutdown_reboot(post_task_action):

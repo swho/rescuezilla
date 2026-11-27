@@ -1,3 +1,5 @@
+# Modified 2026-11-27 (Community Fork): Support multiple --source drives for
+# sequential multi-disk backup (GPL-3.0-or-later).
 import argparse
 from typing import Dict, Any
 
@@ -24,10 +26,16 @@ def valid_compression_level(compression_format, compression_level):
 
 
 def add_option_argument_with_mutually_exclusive_positional_arg(
-    parser: argparse.ArgumentParser, name: str, help: str
+    parser: argparse.ArgumentParser, name: str, help: str, allow_multiple: bool = False
 ):
     pos_group = parser.add_mutually_exclusive_group(required=True)
-    pos_group.add_argument(f"--{name}", nargs="?", default=None, type=str, help=help)
+    pos_group.add_argument(
+        f"--{name}",
+        nargs="+" if allow_multiple else "?",
+        default=None,
+        type=str,
+        help=help,
+    )
     pos_group.add_argument(f"{name}_positional_arg", nargs="?", default=None, type=str)
 
 
@@ -36,6 +44,8 @@ def process_mutually_exclusive_args(
 ):
     pos_arg_key = f"{name}_positional_arg"
     value = getattr(args, name, None) or getattr(args, pos_arg_key, None)
+    if isinstance(value, list) and len(value) == 1:
+        value = value[0]
     if value is not None:
         args_dict[name] = value
     if pos_arg_key in args_dict:
@@ -77,7 +87,10 @@ def parse_arguments(parser: argparse.ArgumentParser) -> argparse.Namespace:
     # Add the --source parsing for all subcommands (except the umount subcommand which doesn't need it) with source can
     # additionally be specified as a positional argument
     add_option_argument_with_mutually_exclusive_positional_arg(
-        backup_parser, "source", "Device to backup"
+        backup_parser,
+        "source",
+        "Device(s) to backup (pass multiple devices for multi-disk backup)",
+        allow_multiple=True,
     )
     add_option_argument_with_mutually_exclusive_positional_arg(
         restore_parser, "source", "Image to use"

@@ -119,7 +119,11 @@ class SeekableCompressorTest(unittest.TestCase):
         self.assertEqual(idx_name, "Info-seekidx-nvme0n1p2.rzidx")
         # Must NOT match Rescuezilla / Clonezilla split image globs!
         self.assertFalse(fnmatch.fnmatch(idx_name, "nvme0n1p2.*-ptcl-img.*"))
-        self.assertFalse(fnmatch.fnmatch(idx_name, "nvme0n1p2[.]*-ptcl-img[.][a-zA-Z]*[.][a-zA-Z][a-zA-Z]"))
+        self.assertFalse(
+            fnmatch.fnmatch(
+                idx_name, "nvme0n1p2[.]*-ptcl-img[.][a-zA-Z]*[.][a-zA-Z][a-zA-Z]"
+            )
+        )
 
         with tempfile.TemporaryDirectory() as td:
             idx_path = os.path.join(td, idx_name)
@@ -128,9 +132,17 @@ class SeekableCompressorTest(unittest.TestCase):
             default_cmd = Utility.get_seekable_compression_cmd_list("gzip", 3, idx_path)
             self.assertIn("1048576", default_cmd)
 
-            cmd = Utility.get_seekable_compression_cmd_list("gzip", 3, idx_path, frame_size=65536)
+            cmd = Utility.get_seekable_compression_cmd_list(
+                "gzip", 3, idx_path, frame_size=65536
+            )
             data = b"hello world " * 20000
-            proc = subprocess.run(cmd, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            proc = subprocess.run(
+                cmd,
+                input=data,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
             self.assertTrue(os.path.isfile(idx_path))
             with open(idx_path, "rb") as f:
                 meta = parse_seekidx_bytes(f.read())
@@ -150,20 +162,35 @@ class SeekableCompressorTest(unittest.TestCase):
             + b"\x00" * (512 * 1024)
             + os.urandom(800 * 1024)
         )
-        for fmt, decomp_cmd in [("gzip", ["gzip", "-d", "-c"]), ("zstd", ["zstd", "-d", "-c"])]:
+        for fmt, decomp_cmd in [
+            ("gzip", ["gzip", "-d", "-c"]),
+            ("zstd", ["zstd", "-d", "-c"]),
+        ]:
             if not shutil.which(decomp_cmd[0]):
                 continue
             with self.subTest(fmt=fmt), tempfile.TemporaryDirectory() as td:
-                idx_path = os.path.join(td, Utility.get_seekable_index_filename("nvme0n1p1"))
+                idx_path = os.path.join(
+                    td, Utility.get_seekable_index_filename("nvme0n1p1")
+                )
                 split_prefix = os.path.join(td, f"nvme0n1p1.ntfs-ptcl-img.{fmt[:2]}.")
                 comp_cmd = Utility.get_seekable_compression_cmd_list(
                     fmt, 3, idx_path, frame_size=1024 * 1024
                 )
-                split_cmd = ["split", "--suffix-length=2", "--bytes=1048576", "-", split_prefix]
+                split_cmd = [
+                    "split",
+                    "--suffix-length=2",
+                    "--bytes=1048576",
+                    "-",
+                    split_prefix,
+                ]
 
                 # Mirror BackupManager: 3 chained Popen processes
                 p_prod = subprocess.Popen(
-                    [sys.executable, "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"],
+                    [
+                        sys.executable,
+                        "-c",
+                        "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())",
+                    ],
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -187,9 +214,15 @@ class SeekableCompressorTest(unittest.TestCase):
                 _, comp_err = p_comp.communicate()
                 _, split_err = p_split.communicate()
 
-                self.assertEqual(p_prod.returncode, 0, prod_err.decode(errors="replace"))
-                self.assertEqual(p_comp.returncode, 0, comp_err.decode(errors="replace"))
-                self.assertEqual(p_split.returncode, 0, split_err.decode(errors="replace"))
+                self.assertEqual(
+                    p_prod.returncode, 0, prod_err.decode(errors="replace")
+                )
+                self.assertEqual(
+                    p_comp.returncode, 0, comp_err.decode(errors="replace")
+                )
+                self.assertEqual(
+                    p_split.returncode, 0, split_err.decode(errors="replace")
+                )
 
                 # Verify multiple split chunks produced (.aa, .ab, ...)
                 chunks = sorted(

@@ -42,18 +42,25 @@ In full compliance with the upstream **GNU General Public License v3.0 or later
      split globs (`*-ptcl-img.*`) ignore the index file during restore.
    - Waits cleanly for compression and split pipeline exit codes and removes
      any `.rzidx` / `.tmp` artifacts if a partition backup fails.
-3. **Added unit & 3-process pipeline tests** (`test/test_seekable_compressor.py`):
+3. **Added multi-disk backup selection (`rescuezilla.glade`, `drive_query.py`, `handler.py`, `backup_manager.py`, `cli/args.py`, `rescuezilla.py`)**:
+   - Adds a checkbox column (`Backup`) to the Backup Step 1 drive list (without affecting Restore or Clone drive selection tables), with fallback support for single-row highlight selection.
+   - Displays all selected drives' partitions in Step 2 (prefixed with `[<drive>]` when multiple drives are selected) and excludes all selected source drives from the Step 3 destination list.
+   - Preserves the exact base folder name when 1 drive is selected; when 2+ drives are selected, sequentially backs up each drive into its own standalone, upstream-compatible folder named `<base_name>-<drive>` (e.g., `2026-11-27-2015-img-rescuezilla-nvme0n1`, `...-nvme1n1`), generating independent `clonezilla-img`, `Info-img-id.txt`, and `Info-seekidx-*.rzidx` per drive, keeping `/mnt/backup` mounted across the batch, and scheduling any post-task shutdown/reboot only once after all drives finish.
+   - Extends `rescuezillapy backup --source` to accept multiple drives (`--source /dev/sda /dev/sdb`).
+4. **Added unit & pipeline tests** (`test/test_seekable_compressor.py`, `test/test_multi_drive_backup.py`):
    - Verifies gzip & zstd multi-frame compression, stock `gzip -d` / `zstd -d`
      decompression compatibility, O(1) random frame seeking, CRC32 validation,
      the full 3-process `partclone -> seekable_compressor -> split` `Popen`
-     pipeline, and Clonezilla glob non-collision.
+     pipeline, Clonezilla glob non-collision, multi-disk folder naming, batch
+     execution/cancellation, CLI multi-`--source` parsing, and Glade XML schema.
 
 ## Current Verification Status
 
 - **Verified**:
-  - Python unit tests and 3-process `Popen` + GNU `split` pipeline tests (`test/test_seekable_compressor.py`).
-  - Full Ubuntu 24.04 (`noble`) Debian package + bootable Live ISO build via the upstream `Dockerfile` & `Makefile`.
-  - Live boot of the built ISO inside VMware Workstation (`26.0.1`), running real `rescuezillapy backup` (both `gzip` and `zstd` with 1 MiB frames) against a Debian 12 guest disk (`ext4` + `btrfs` + `vfat` + `bios_grub`), verifying `Info-seekidx-*.rzidx` generation across all 4 partitions.
-  - Full destructive wipe of the guest OS disk followed by live `rescuezillapy restore`, clean guest OS reboot, and 100% SHA-256 verification of all sentinel files & symlinks across `ext4`, `btrfs`, and `vfat`.
-  - End-to-end O(1) instant loading and 100% SHA-256 recovery of both the live `gzip` and `zstd` backup images in `rescuezilla-browser`.
-- **Not yet verified**: Physical bare-metal USB boot (including UEFI Secure Boot on physical firmware) and interactive GTK GUI wizard run (automated VM test exercised the shared `BackupManager`/`RestoreManager` backend via `rescuezillapy` CLI).
+  - Python unit tests (`make test`: 43 tests, including `test_seekable_compressor.py` 3-process `Popen` + GNU `split` pipeline tests and `test_multi_drive_backup.py` batch/cancel/CLI/Glade tests) and `ruff format` / pyflakes checks.
+  - Full Ubuntu 24.04 (`noble`) Debian package + bootable Live ISO build (both test and clean no-SSH release ISOs) via the upstream `Dockerfile` & `Makefile`.
+  - Live boot of the unmodified built ISO inside VMware Workstation (`26.0.1`), including live GTK3 + Glade UI verification against X11 (`backup_drive_toggled`, row double-click toggle, refresh preservation, Step 2 multi-disk partition prefixes, Back/Next navigation, Step 3 exclusion of all source drives, Step 5 folder naming for single- & multi-disk, Step 7 Pango confirmation markup).
+  - Real multi-disk `rescuezillapy backup` (both `gzip` and `zstd` with 1 MiB frames) backing up two guest disks (`ext4` + `btrfs` + `vfat` + `bios_grub` on Disk 1; `vfat` + `btrfs` on Disk 2) into standalone `<base>-<drive>` folders, plus single-disk backup confirming no suffix is appended.
+  - Full destructive wipe of both guest disks followed by live `rescuezillapy restore` (Disk 1 from `gzip`, Disk 2 from `zstd`), clean guest OS reboot, and 100% SHA-256 verification of all 12 sentinel files and 3 symlinks across both disks.
+  - End-to-end O(1) instant loading and 100% SHA-256 recovery of all 4 live multi-disk `gzip` and `zstd` backup images in `rescuezilla-browser`.
+- **Not yet verified**: Physical bare-metal USB boot (including UEFI Secure Boot on physical firmware) and manual mouse-click execution of an end-to-end GTK backup run.

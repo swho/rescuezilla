@@ -5,6 +5,8 @@
 #   Modified 2026-11-25 (Community Fork): Added seekable multi-frame
 #   compression and Info-seekidx-<part>.rzidx generation during backup
 #   (GPL-3.0-or-later).
+#   Modified 2026-11-27 (Community Fork): Added multi-disk sequential batch
+#   backup with per-disk destination folder naming (GPL-3.0-or-later).
 # ----------------------------------------------------------------------
 #   This program is free software: you can redistribute it and/or modify
 #   it under the terms of the GNU General Public License as published by
@@ -44,6 +46,124 @@ from parser.swappt import Swappt
 from utility import Utility, _
 
 
+def sanitize_drive_suffix(drive_key: str) -> str:
+    """Return a clean filename-safe short device name (e.g. '/dev/nvme0n1' -> 'nvme0n1')."""
+    short = re.sub(r"^/dev/", "", str(drive_key).strip())
+    short = re.sub(r"[^A-Za-z0-9._-]+", "_", short).strip("._-")
+    return short or "disk"
+
+
+def compute_backup_dest_dirs(
+    base_dest_dir: str, selected_drive_keys
+) -> collections.OrderedDict:
+    """Compute per-drive backup destination folder paths.
+
+    - Single selected drive: keeps exact base_dest_dir (100% identical to upstream).
+    - Multiple selected drives: appends '-<short_drive_name>' to base_dest_dir for each drive,
+      producing standalone upstream-compatible Rescuezilla/Clonezilla backup folders.
+    """
+    keys = (
+        [selected_drive_keys]
+        if isinstance(selected_drive_keys, str)
+        else list(selected_drive_keys)
+    )
+    result = collections.OrderedDict()
+    if len(keys) <= 1:
+        for dk in keys:
+            result[dk] = base_dest_dir
+        return result
+
+    clean_base = (
+        base_dest_dir.rstrip(os.sep) if base_dest_dir != os.sep else base_dest_dir
+    )
+    used = set()
+    for dk in keys:
+        suffix = sanitize_drive_suffix(dk)
+        candidate = f"{clean_base}-{suffix}"
+        if candidate in used:
+            n = 2
+            while f"{candidate}-{n}" in used:
+                n += 1
+            candidate = f"{candidate}-{n}"
+        used.add(candidate)
+        result[dk] = candidate
+    return result
+
+
+class _BatchDriveUiProxy:
+    """Per-drive UiManager proxy used during multi-disk sequential backup.
+
+    Scales progress across all drives, prefixes status messages with '[i/N: drive]',
+    and captures per-drive completion/errors synchronously without advancing wizard
+    tabs, unmounting /mnt/backup, or scheduling shutdown mid-batch.
+    """
+
+    def __init__(
+        self, real_ui: UiManager, drive_index: int, total_drives: int, drive_key: str
+    ):
+        self._real_ui = real_ui
+        self._drive_index = drive_index
+        self._total_drives = max(1, total_drives)
+        self._drive_key = drive_key
+        self._short_drive = sanitize_drive_suffix(drive_key)
+        self._prefix = f"[{drive_index + 1}/{self._total_drives} {self._short_drive}] "
+        self.logger = None
+        self.succeeded = None
+        self.message = ""
+        self.error_messages = []
+
+    def set_logger(self, logger):
+        self.logger = logger
+        self._real_ui.set_logger(logger)
+
+    def update_progress_bar(self, fraction: float):
+        clamped = max(0.0, min(1.0, float(fraction)))
+        overall = (self._drive_index + clamped) / self._total_drives
+        self._real_ui.update_progress_bar(fraction=overall)
+
+    def update_progress_status(self, message: str):
+        prefixed = self._prefix + message if message else ""
+        self._real_ui.update_progress_status(message=prefixed)
+
+    def get_post_task_action(self) -> str:
+        return "DO_NOTHING"
+
+    def update_main_statusbar(self, message: str):
+        prefixed = self._prefix + message if message else ""
+        self._real_ui.update_main_statusbar(message=prefixed)
+
+    def display_status(self, msg1: str, msg2: str):
+        self._real_ui.display_status(msg1=self._prefix + msg1, msg2=msg2)
+
+    def remove_all_main_statusbar(self, context_id: str):
+        # Keep statusbar active until entire batch completes.
+        return
+
+    def display_error_message(self, summary_message: str, heading: str = ""):
+        text = f"{heading}\n{summary_message}".strip() if heading else summary_message
+        self.error_messages.append(text)
+        if self.logger is not None:
+            self.logger.write(text)
+        else:
+            print(text)
+
+    def completed_operation(self, callable_fn, succeeded: bool, message: str):
+        # Record per-drive completion without triggering GUI tab transition or umount.
+        self.succeeded = succeeded
+        self.message = message or ""
+        return succeeded, self.message
+
+    def _on_operation_completed_callback(self, is_success):
+        pass
+
+    def escape_text(self, input: str) -> str:
+        return self._real_ui.escape_text(input=input)
+
+    def display_summary_text(self, text_to_display):
+        # Deferred to final consolidated multi-drive summary page.
+        return
+
+
 # Signals should automatically propagate to processes called with subprocess.run().
 # TODO: This class uses 'subprocess.call', which provides exit code but not stdout/stderr. It would be
 # TODO: VERY useful to display stdout/stderr when the exit code is non-zero, like the RestoreManager does.
@@ -58,6 +178,7 @@ class BackupManager:
         self.logger = None
 
         self.requested_stop = False
+        self._is_batch_mode = False
 
     def is_backup_in_progress(self):
         with self.backup_in_progress_lock:
@@ -104,6 +225,257 @@ class BackupManager:
         else:
             return self.do_backup()
 
+    def start_multi_drive_backup(
+        self,
+        backup_jobs,
+        drive_state,
+        backup_notes,
+        compression_dict,
+        is_rescue,
+        completed_backup_callback,
+        on_separate_thread=True,
+    ):
+        """Sequentially back up multiple drives, each into its own standalone backup folder.
+
+        Args:
+            backup_jobs: List of (drive_key, partitions_to_backup, dest_dir) tuples.
+        """
+        jobs = list(backup_jobs)
+        if len(jobs) == 0:
+            raise ValueError("backup_jobs must not be empty")
+        if len(jobs) == 1:
+            dk, parts, dest = jobs[0]
+            return self.start_backup(
+                selected_drive_key=dk,
+                partitions_to_backup=parts,
+                drive_state=drive_state,
+                dest_dir=dest,
+                backup_notes=backup_notes,
+                compression_dict=compression_dict,
+                is_rescue=is_rescue,
+                completed_backup_callback=completed_backup_callback,
+                metadata_only_image_to_annotate=None,
+                on_separate_thread=on_separate_thread,
+            )
+
+        self.backup_timestart = datetime.now()
+        self.completed_backup_callback = completed_backup_callback
+        self.backup_jobs = jobs
+        self.drive_state = drive_state
+        self.backup_notes = backup_notes
+        self.compression_dict = compression_dict
+        self.is_rescue = is_rescue
+        self.metadata_only_image_to_annotate = None
+        self.is_cloning = False
+        self.requested_stop = False
+        self._is_batch_mode = True
+        self.summary_message_lock = threading.Lock()
+        self.summary_message = ""
+        self.ui_manager.update_progress_bar(fraction=0)
+        with self.backup_in_progress_lock:
+            self.backup_in_progress = True
+
+        if on_separate_thread:
+            thread = threading.Thread(target=self._do_multi_drive_backup_wrapper)
+            thread.daemon = True
+            thread.start()
+        else:
+            return self._do_multi_drive_backup()
+
+    def _do_multi_drive_backup_wrapper(self):
+        try:
+            self._do_multi_drive_backup()
+        except Exception:
+            tb = traceback.format_exc()
+            traceback.print_exc()
+            self.ui_manager.completed_operation(
+                callable_fn=self._completed_multi_drive_backup,
+                succeeded=False,
+                message=_("Error creating backup: ") + tb,
+            )
+            return
+
+    def _do_multi_drive_backup(self):
+        real_ui = self.ui_manager
+        total_drives = len(self.backup_jobs)
+        batch_sections = []
+        succeeded_count = 0
+        failed_count = 0
+        had_any_non_fatal = False
+        cancelled = False
+
+        for idx, (drive_key, partitions_to_backup, dest_dir) in enumerate(
+            self.backup_jobs
+        ):
+            if self.requested_stop:
+                cancelled = True
+                batch_sections.append(
+                    f"[{idx + 1}/{total_drives}] {drive_key} -> {dest_dir}\n"
+                    f"  " + _("Operation cancelled by user.")
+                )
+                continue
+
+            drive_start = datetime.now()
+            proxy = _BatchDriveUiProxy(
+                real_ui=real_ui,
+                drive_index=idx,
+                total_drives=total_drives,
+                drive_key=drive_key,
+            )
+            self.ui_manager = proxy
+            self.selected_drive_key = drive_key
+            self.partitions_to_backup = partitions_to_backup
+            self.dest_dir = dest_dir
+            self.logger = None
+            drive_succeeded = False
+            drive_err_msg = ""
+
+            try:
+                ret = self.do_backup()
+                if proxy.succeeded is not None:
+                    drive_succeeded = bool(proxy.succeeded)
+                    drive_err_msg = proxy.message
+                elif isinstance(ret, tuple) and len(ret) >= 2:
+                    drive_succeeded = bool(ret[0])
+                    drive_err_msg = str(ret[1] or "")
+                else:
+                    drive_succeeded = True
+            except Exception:
+                tb = traceback.format_exc()
+                traceback.print_exc()
+                drive_succeeded = False
+                drive_err_msg = _("Error creating backup: ") + tb
+            finally:
+                try:
+                    self._finalize_clonezilla_img_and_id(dest_dir=dest_dir)
+                except Exception:
+                    traceback.print_exc()
+                self.ui_manager = real_ui
+                real_ui.set_logger(None)
+
+            drive_elapsed = Utility.get_human_readable_minutes_seconds(
+                (datetime.now() - drive_start).total_seconds()
+            )
+            drive_summary = (self.summary_message or "").strip()
+            if self.at_least_one_non_fatal_error:
+                had_any_non_fatal = True
+
+            if self.requested_stop:
+                cancelled = True
+                failed_count += 1
+                status_line = _("Operation cancelled by user.")
+            elif drive_succeeded:
+                succeeded_count += 1
+                status_line = (
+                    _("Backup succeeded with some errors:")
+                    if self.at_least_one_non_fatal_error
+                    else _("Backup saved successfully.")
+                )
+            else:
+                failed_count += 1
+                status_line = _("Backup operation failed:")
+
+            sec_lines = [
+                f"=== [{idx + 1}/{total_drives}] {drive_key} -> {dest_dir} ({drive_elapsed} min) ===",
+                status_line,
+            ]
+            if drive_summary:
+                sec_lines.append(drive_summary)
+            if drive_err_msg:
+                sec_lines.append(drive_err_msg)
+            if proxy.error_messages:
+                sec_lines.extend(proxy.error_messages)
+            batch_sections.append("\n".join(sec_lines))
+
+        overall_succeeded = (
+            (failed_count == 0)
+            and (not cancelled)
+            and (succeeded_count == total_drives)
+        )
+        self.at_least_one_non_fatal_error = had_any_non_fatal
+        self.summary_message_lock = threading.Lock()
+        header = (
+            f"Multi-drive backup: {succeeded_count}/{total_drives} drive(s) succeeded"
+        )
+        if failed_count > 0:
+            header += f", {failed_count} failed"
+        if cancelled:
+            header += " (cancelled)"
+        self.summary_message = header + "\n\n" + "\n\n".join(batch_sections) + "\n"
+        if overall_succeeded:
+            real_ui.update_progress_bar(fraction=1.0)
+        err_msg = _("Operation cancelled by user.") if cancelled else ""
+        return real_ui.completed_operation(
+            callable_fn=self._completed_multi_drive_backup,
+            succeeded=overall_succeeded,
+            message=err_msg,
+        )
+
+    def _completed_multi_drive_backup(self, succeeded, message):
+        self.ui_manager.update_progress_status(message="")
+        self.ui_manager.remove_all_main_statusbar(context_id="backup")
+        backup_timeend = datetime.now()
+        duration_minutes = Utility.get_human_readable_minutes_seconds(
+            (backup_timeend - self.backup_timestart).total_seconds()
+        )
+        duration_message = _("Operation took {num_minutes} minutes.").format(
+            num_minutes=duration_minutes
+        )
+
+        with self.summary_message_lock:
+            if succeeded:
+                if not self.at_least_one_non_fatal_error:
+                    self.summary_message = (
+                        _("Backup saved successfully.")
+                        + "\n\n"
+                        + self.summary_message
+                        + "\n"
+                    )
+                else:
+                    self.summary_message = (
+                        _("Backup succeeded with some errors:")
+                        + "\n\n"
+                        + self.summary_message
+                        + "\n"
+                    )
+            else:
+                heading = _("Backup operation failed:")
+                extra = ("\n\n" + message) if message else ""
+                self.summary_message = (
+                    heading + "\n\n" + self.summary_message + extra + "\n"
+                )
+                self.ui_manager.display_error_message(
+                    summary_message=self.summary_message, heading=heading
+                )
+
+            self.summary_message += duration_message + "\n"
+            post_task_action: str = self.ui_manager.get_post_task_action()
+            if post_task_action != "DO_NOTHING":
+                if succeeded:
+                    has_scheduled, msg = Utility.schedule_shutdown_reboot(
+                        post_task_action
+                    )
+                    self.summary_message += "\n" + msg
+                else:
+                    self.summary_message += "\n" + _(
+                        "Shutdown/Reboot cancelled due to errors."
+                    )
+
+        self.populate_summary_page()
+
+        is_unmounted, umount_message = Utility.umount_warn_on_busy(
+            "/mnt/backup", is_lazy_umount=True
+        )
+        if not is_unmounted:
+            print(umount_message)
+            with self.summary_message_lock:
+                self.summary_message += umount_message + "\n"
+
+        with self.backup_in_progress_lock:
+            self._is_batch_mode = False
+            self.backup_in_progress = False
+        self.completed_backup_callback(succeeded)
+
     # Intended to be called via event thread
     # Sending signals to process objects on its own thread. Relying on Python GIL.
     # TODO: Threading practices here need overhaul. Use threading.Lock() instead of GIL
@@ -111,19 +483,29 @@ class BackupManager:
         # Again, relying on GIL.
         self.requested_stop = True
         if len(self.proc) == 0:
-            self.logger.write("Nothing to cancel")
+            if self.logger is not None:
+                self.logger.write("Nothing to cancel")
         else:
-            self.logger.write(
-                "Will send cancel signal to " + str(len(self.proc)) + " processes."
-            )
-            for key in self.proc.keys():
+            if self.logger is not None:
+                self.logger.write(
+                    "Will send cancel signal to " + str(len(self.proc)) + " processes."
+                )
+            for key in list(self.proc.keys()):
                 process = self.proc[key]
                 try:
-                    self.logger.write("Sending SIGTERM to " + str(process))
+                    if self.logger is not None:
+                        self.logger.write("Sending SIGTERM to " + str(process))
                     # Send SIGTERM
                     process.terminate()
                 except Exception:
-                    self.logger.write("Error killing process. (Maybe already dead?)")
+                    if self.logger is not None:
+                        self.logger.write(
+                            "Error killing process. (Maybe already dead?)"
+                        )
+        if self._is_batch_mode:
+            # Let the batch worker thread finish tearing down the active drive,
+            # unmount /mnt/backup once, and fire _completed_multi_drive_backup once.
+            return
         with self.backup_in_progress_lock:
             self.backup_in_progress = False
         if not self.is_cloning:
@@ -165,7 +547,8 @@ class BackupManager:
         pp = pprint.PrettyPrinter(indent=4)
         pp.pprint(self.partitions_to_backup)
         self.at_least_one_non_fatal_error = False
-        self.requested_stop = False
+        if not self._is_batch_mode:
+            self.requested_stop = False
         # Clear proc dictionary
         self.proc.clear()
         self.summary_message_lock = threading.Lock()
@@ -1733,6 +2116,49 @@ class BackupManager:
             return False, message, is_windows_reserved
         return True, "", is_windows_reserved
 
+    def _finalize_clonezilla_img_and_id(self, dest_dir=None):
+        """Close the active Logger and generate Clonezilla's Info-img-id.txt checksum tag."""
+        target_dir = dest_dir if dest_dir is not None else self.dest_dir
+        clonezilla_img_filepath = os.path.join(target_dir, "clonezilla-img")
+        info_img_id_filepath = os.path.join(target_dir, "Info-img-id.txt")
+        if self.logger is not None:
+            self.logger.write(
+                "Closing the logfile "
+                + clonezilla_img_filepath
+                + " and generating a tag file for this image: "
+                + info_img_id_filepath
+            )
+            self.logger.close()
+            self.logger = None
+
+        if os.path.isfile(clonezilla_img_filepath):
+            process, flat_command_string, failed_message = Utility.run(
+                "Checksumming clonezilla-img file",
+                ["sha512sum", clonezilla_img_filepath],
+                use_c_locale=True,
+                output_filepath=None,
+                logger=None,
+            )
+            if process.returncode != 0:
+                self.ui_manager.display_error_message(summary_message=failed_message)
+            else:
+                sha512sum_output = process.stdout
+                split = sha512sum_output.split("  ")
+                if len(split) == 2:
+                    with open(info_img_id_filepath, "w") as filehandle:
+                        filehandle.write(
+                            "# This checksum is only for identifying the image. Created by the command: sha512sum clonezilla-img\n"
+                        )
+                        filehandle.write("IMG_ID=%s" % split[0])
+                        filehandle.flush()
+                else:
+                    self.ui_manager.display_error_message(
+                        summary_message="Failed to output checksum file Info-img-id.txt: "
+                        + process.stdout
+                        + "\n\n"
+                        + process.stderr
+                    )
+
     def completed_backup(self, succeeded, message):
         self.ui_manager.update_progress_status(message="")
         self.ui_manager.remove_all_main_statusbar(context_id="backup")
@@ -1798,50 +2224,10 @@ class BackupManager:
             self.populate_summary_page()
 
             # Clonezilla writes a file named "Info-img-id.txt" which contains a sha512sum of the clonezilla-img log file.
-            # "Generate a checksum for identifying the image later. This is based on the file $img_dir/clonezilla-img."
-            # It doesn't seem that useful, but because Clonezilla does this, Rescuezilla does this too.
-            clonezilla_img_filepath = os.path.join(self.dest_dir, "clonezilla-img")
-            info_img_id_filepath = os.path.join(self.dest_dir, "Info-img-id.txt")
-            if self.logger is not None:
-                self.logger.write(
-                    "Closing the logfile "
-                    + clonezilla_img_filepath
-                    + " and generating a tag file for this image: "
-                    + info_img_id_filepath
-                )
-
-            if os.path.isfile(clonezilla_img_filepath):
-                process, flat_command_string, failed_message = Utility.run(
-                    "Checksumming clonezilla-img file",
-                    ["sha512sum", clonezilla_img_filepath],
-                    use_c_locale=True,
-                    output_filepath=None,
-                    logger=None,
-                )
-                if process.returncode != 0:
-                    self.ui_manager.display_error_message(
-                        summary_message=failed_message
-                    )
-                else:
-                    sha512sum_output = process.stdout
-                    split = sha512sum_output.split("  ")
-                    if len(split) == 2:
-                        with open(info_img_id_filepath, "w") as filehandle:
-                            filehandle.write(
-                                "# This checksum is only for identifying the image. Created by the command: sha512sum clonezilla-img\n"
-                            )
-                            filehandle.write("IMG_ID=%s" % split[0])
-                            filehandle.flush()
-                    else:
-                        self.ui_manager.display_error_message(
-                            summary_message="Failed to output checksum file Info-img-id.txt: "
-                            + process.stdout
-                            + "\n\n"
-                            + process.stderr
-                        )
-
-        if self.logger:
+            self._finalize_clonezilla_img_and_id()
+        elif self.logger:
             self.logger.close()
+            self.logger = None
 
         if not self.is_cloning:
             is_unmounted, umount_message = Utility.umount_warn_on_busy(

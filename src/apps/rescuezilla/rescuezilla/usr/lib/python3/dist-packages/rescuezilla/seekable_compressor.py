@@ -60,7 +60,9 @@ _HEADER_STRUCT = struct.Struct("<8sIIIIQQ")  # 40 bytes
 _ENTRY_STRUCT = struct.Struct("<QQ")  # 16 bytes
 _CRC_STRUCT = struct.Struct("<I")  # 4 bytes
 
-DEFAULT_FRAME_SIZE = 1 * 1024 * 1024  # 1 MiB (fine random-access granularity, <0.05% overhead)
+DEFAULT_FRAME_SIZE = (
+    1 * 1024 * 1024
+)  # 1 MiB (fine random-access granularity, <0.05% overhead)
 
 
 def compress_gzip_frame(data: bytes, level: int) -> bytes:
@@ -82,7 +84,9 @@ def compress_zstd_frame(data: bytes, level: int) -> bytes:
     )
     if proc.returncode != 0:
         err = proc.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"zstd frame compression failed (rc={proc.returncode}): {err}")
+        raise RuntimeError(
+            f"zstd frame compression failed (rc={proc.returncode}): {err}"
+        )
     return proc.stdout
 
 
@@ -147,7 +151,9 @@ def parse_seekidx_bytes(raw: bytes) -> dict:
     return {
         "version": version,
         "codec": codec,
-        "codec_name": "gzip" if codec == CODEC_GZIP else ("zstd" if codec == CODEC_ZSTD else "unknown"),
+        "codec_name": "gzip"
+        if codec == CODEC_GZIP
+        else ("zstd" if codec == CODEC_ZSTD else "unknown"),
         "frame_size": frame_size,
         "frame_count": frame_count,
         "total_compressed": total_comp,

@@ -6,6 +6,8 @@
 # ----------------------------------------------------------------------
 #   Copyright (C) 2012 RedoBackup.org
 #   Copyright (C) 2019-2025 Rescuezilla.com <rescuezilla@gmail.com>
+#   Modified 2026-11-27 (Community Fork): Support multiple --source drives in
+#   CLI backup mode (GPL-3.0-or-later).
 # ----------------------------------------------------------------------
 #   This program is free software: you can redistribute it and/or modify
 #   it under the terms of the GNU General Public License as published by
@@ -25,7 +27,7 @@ import os
 import sys
 import argparse
 
-from backup_manager import BackupManager
+from backup_manager import BackupManager, compute_backup_dest_dirs
 from cli.args import parse_arguments
 from parser.clonezilla_image import ClonezillaImage
 from parser.metadata_only_image import MetadataOnlyImage
@@ -108,21 +110,36 @@ def cli_mode(args: argparse.Namespace, human_readable_version: str):
         cli_drive_query = CliDriveQuery()
         drive_query = DriveQueryInternal(ui_manager=cli_drive_query)
         drive_state = drive_query._do_drive_query()
-        backup_manager.start_backup(
-            selected_drive_key=args.source,
-            partitions_to_backup=args.partitions,
-            drive_state=drive_state,
-            dest_dir=args.destination,
-            backup_notes=args.description,
-            compression_dict={
-                "format": args.compression_format,
-                "level": args.compression_level,
-            },
-            is_rescue=args.rescue,
-            completed_backup_callback=cli_ui_manager._on_operation_completed_callback,
-            metadata_only_image_to_annotate=None,
-            on_separate_thread=False,
-        )
+        compression_dict = {
+            "format": args.compression_format,
+            "level": args.compression_level,
+        }
+        if isinstance(args.source, list) and len(args.source) > 1:
+            dest_dirs = compute_backup_dest_dirs(args.destination, args.source)
+            backup_jobs = [(dk, args.partitions, dest_dirs[dk]) for dk in args.source]
+            backup_manager.start_multi_drive_backup(
+                backup_jobs=backup_jobs,
+                drive_state=drive_state,
+                backup_notes=args.description,
+                compression_dict=compression_dict,
+                is_rescue=args.rescue,
+                completed_backup_callback=cli_ui_manager._on_operation_completed_callback,
+                on_separate_thread=False,
+            )
+        else:
+            src_drive = args.source[0] if isinstance(args.source, list) else args.source
+            backup_manager.start_backup(
+                selected_drive_key=src_drive,
+                partitions_to_backup=args.partitions,
+                drive_state=drive_state,
+                dest_dir=args.destination,
+                backup_notes=args.description,
+                compression_dict=compression_dict,
+                is_rescue=args.rescue,
+                completed_backup_callback=cli_ui_manager._on_operation_completed_callback,
+                metadata_only_image_to_annotate=None,
+                on_separate_thread=False,
+            )
     elif args.command == "restore":
         image = get_clonezilla_img(source_path=args.source)
         restore_manager = RestoreManager(ui_manager=cli_ui_manager)

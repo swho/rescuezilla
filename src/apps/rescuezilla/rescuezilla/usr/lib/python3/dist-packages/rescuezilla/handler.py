@@ -2,6 +2,9 @@
 #   Copyright (C) 2012 RedoBackup.org
 #   Copyright (C) 2003-2025 Steven Shiau <steven _at_ clonezilla org>
 #   Copyright (C) 2019-2025 Rescuezilla.com <rescuezilla@gmail.com>
+#   Modified 2026-11-27 (Community Fork): Added multi-disk backup checkbox
+#   selection, per-drive destination folder naming, and batch backup execution
+#   wiring (GPL-3.0-or-later).
 # ----------------------------------------------------------------------
 #   This program is free software: you can redistribute it and/or modify
 #   it under the terms of the GNU General Public License as published by
@@ -24,7 +27,7 @@ import threading
 import traceback
 from datetime import datetime
 
-from backup_manager import BackupManager
+from backup_manager import BackupManager, compute_backup_dest_dirs
 from gtk_ui_manager import GtkUiManager
 from clone_manager import CloneManager
 from image_explorer_manager import ImageExplorerManager
@@ -115,6 +118,11 @@ class Handler:
         self.set_patreon_call_to_action_visible(True)
         # TODO: Remove the need to set this variable to None
         self.selected_drive_key = None
+        self.selected_drive_keys = []
+        self.active_backup_drive_keys = []
+        self.selected_drives_meta = collections.OrderedDict()
+        self.partitions_to_backup_by_drive = collections.OrderedDict()
+        self.dest_dirs_by_drive = collections.OrderedDict()
         # Ensuring toggle button is ticked and consistency of the user-interface elements that are associated with this
         # checkbox.
 
@@ -347,6 +355,11 @@ class Handler:
             self.main_statusbar.get_context_id("version"), self.human_readable_version
         )
         self.selected_drive_key = None
+        self.selected_drive_keys = []
+        self.active_backup_drive_keys = []
+        self.selected_drives_meta = collections.OrderedDict()
+        self.partitions_to_backup_by_drive = collections.OrderedDict()
+        self.dest_dirs_by_drive = collections.OrderedDict()
 
         self.builder.get_object("mode_tabs").set_current_page(0)
         # Disable the forward/previous navigation buttons on the welcome page
@@ -381,6 +394,13 @@ class Handler:
 
     def display_backup_wizard(self, button):
         self.mode = Mode.BACKUP
+        self.selected_drive_key = None
+        self.selected_drive_keys = []
+        self.active_backup_drive_keys = []
+        self.selected_drives_meta = collections.OrderedDict()
+        self.partitions_to_backup_by_drive = collections.OrderedDict()
+        self.dest_dirs_by_drive = collections.OrderedDict()
+        self.drive_list_store.clear()
         self.drive_query.start_query(self._display_error_message_callback)
         self.main_statusbar.pop(self.main_statusbar.get_context_id("version"))
         self.current_page = Page.BACKUP_SOURCE_DRIVE_SELECTION
@@ -482,45 +502,80 @@ class Handler:
             )
             if self.mode == Mode.BACKUP:
                 if self.current_page == Page.BACKUP_SOURCE_DRIVE_SELECTION:
-                    list_store, iters = self.get_rows(
-                        "backup_drive_selection_treeselection"
-                    )
-                    if len(iters) == 0:
+                    checked_rows = []
+                    if self.drive_list_store.get_n_columns() > 6:
+                        for row in self.drive_list_store:
+                            if row[6]:
+                                checked_rows.append((row[0], row[1], row[2], row[3]))
+                    # Backwards-compatible fallback: if user didn't tick any checkbox,
+                    # accept a highlighted single row just like upstream Rescuezilla.
+                    if len(checked_rows) == 0:
+                        list_store, iters = self.get_rows(
+                            "backup_drive_selection_treeselection"
+                        )
+                        if len(iters) > 0:
+                            checked_rows.append(
+                                (
+                                    list_store.get(iters[0], 0)[0],
+                                    list_store.get(iters[0], 1)[0],
+                                    list_store.get(iters[0], 2)[0],
+                                    list_store.get(iters[0], 3)[0],
+                                )
+                            )
+                    if len(checked_rows) == 0:
                         ErrorMessageModalPopup(
                             self.builder,
                             "No source drive selected. Please select source "
                             "drive to backup",
                         )
                     else:
-                        # Get first column (which is hidden/invisible) containing the drive shortdevname (eg, 'sda')
-                        key = list_store.get(iters[0], 0)[0]
-                        if self.drive_query.drive_state[key][
-                            "has_raid_member_filesystem"
-                        ]:
-                            ErrorMessageModalPopup(
-                                self.builder, self.source_contains_raid_member_msg
-                            )
-                            return
-                        elif (
-                            "partitions" not in self.drive_query.drive_state[key].keys()
-                        ):
-                            ErrorMessageModalPopup(
-                                self.builder,
-                                "Backup of drives without a partition table *and* no filesystem is not yet supported by current version of Rescuezilla.\n\nSupport for this will be added in a future version.",
-                            )
-                            return
-                        self.selected_drive_key = key
-                        print("User selected drive: " + self.selected_drive_key)
+                        selected_keys = []
+                        selected_meta = collections.OrderedDict()
+                        for key, drive_num, drive_cap, drive_model in checked_rows:
+                            if self.drive_query.drive_state[key][
+                                "has_raid_member_filesystem"
+                            ]:
+                                ErrorMessageModalPopup(
+                                    self.builder,
+                                    self.source_contains_raid_member_msg
+                                    + f"\n\n({key})",
+                                )
+                                return
+                            elif (
+                                "partitions"
+                                not in self.drive_query.drive_state[key].keys()
+                            ):
+                                ErrorMessageModalPopup(
+                                    self.builder,
+                                    f"({key}) "
+                                    + "Backup of drives without a partition table *and* no filesystem is not yet supported by current version of Rescuezilla.\n\nSupport for this will be added in a future version.",
+                                )
+                                return
+                            selected_keys.append(key)
+                            selected_meta[key] = {
+                                "number": drive_num,
+                                "capacity": drive_cap,
+                                "model": drive_model,
+                            }
+
+                        self.selected_drive_keys = selected_keys
+                        self.selected_drives_meta = selected_meta
+                        self.selected_drive_key = selected_keys[0]
+                        print(
+                            "User selected drive(s): "
+                            + ", ".join(self.selected_drive_keys)
+                        )
                         self.drive_query.populate_partition_selection_table(
-                            self.selected_drive_key
+                            self.selected_drive_keys
                         )
 
-                        self.selected_drive_enduser_friendly_drive_number = (
-                            list_store.get(iters[0], 1)[0]
-                        )
-                        self.selected_drive_capacity = list_store.get(iters[0], 2)[0]
+                        first_meta = selected_meta[self.selected_drive_key]
+                        self.selected_drive_enduser_friendly_drive_number = first_meta[
+                            "number"
+                        ]
+                        self.selected_drive_capacity = first_meta["capacity"]
                         # FIXME: May be None for devices like /dev/md127
-                        self.selected_drive_model = list_store.get(iters[0], 3)[0]
+                        self.selected_drive_model = first_meta["model"]
 
                         self.current_page = Page.BACKUP_SOURCE_PARTITION_SELECTION
                         self.builder.get_object("backup_tabs").set_current_page(1)
@@ -528,23 +583,48 @@ class Handler:
                     partition_list_store = self.builder.get_object(
                         "save_partition_list"
                     )
-                    self.partitions_to_backup = collections.OrderedDict()
+                    self.partitions_to_backup_by_drive = collections.OrderedDict()
                     has_atleast_one = False
+                    has_parent_col = partition_list_store.get_n_columns() > 3
                     for row in partition_list_store:
                         print("row is " + str(row))
                         if row[1]:
-                            self.partitions_to_backup[row[0]] = (
-                                self.drive_query.drive_state[self.selected_drive_key][
-                                    "partitions"
-                                ][row[0]]
+                            parent_drive = (
+                                row[3]
+                                if has_parent_col and row[3]
+                                else self.selected_drive_key
                             )
-                            self.partitions_to_backup[row[0]]["description"] = row[2]
+                            if parent_drive not in self.partitions_to_backup_by_drive:
+                                self.partitions_to_backup_by_drive[parent_drive] = (
+                                    collections.OrderedDict()
+                                )
+                            part_dict = self.drive_query.drive_state[parent_drive][
+                                "partitions"
+                            ][row[0]]
+                            part_dict["description"] = row[2]
+                            self.partitions_to_backup_by_drive[parent_drive][row[0]] = (
+                                part_dict
+                            )
                             has_atleast_one = True
                     if not has_atleast_one:
                         ErrorMessageModalPopup(self.builder, "Nothing selected!")
                     else:
+                        active_drive_keys = list(
+                            self.partitions_to_backup_by_drive.keys()
+                        )
+                        self.active_backup_drive_keys = active_drive_keys
+                        self.selected_drive_key = active_drive_keys[0]
+                        self.partitions_to_backup = self.partitions_to_backup_by_drive[
+                            self.selected_drive_key
+                        ]
+                        first_meta = self.selected_drives_meta[self.selected_drive_key]
+                        self.selected_drive_enduser_friendly_drive_number = first_meta[
+                            "number"
+                        ]
+                        self.selected_drive_capacity = first_meta["capacity"]
+                        self.selected_drive_model = first_meta["model"]
                         self.drive_query.populate_mount_partition_table(
-                            ignore_drive_key=self.selected_drive_key
+                            ignore_drive_keys=self.active_backup_drive_keys
                         )
                         self.current_page = Page.BACKUP_DESTINATION_LOCATION_SELECTION
                         self.builder.get_object("backup_tabs").set_current_page(2)
@@ -565,17 +645,26 @@ class Handler:
                     ).get_text()
                     folder_name = self.builder.get_object("backup_name").get_text()
                     dest_dir = os.path.join(selected_directory, folder_name)
-                    if os.path.exists(dest_dir):
+                    planned_dest_dirs = compute_backup_dest_dirs(
+                        dest_dir, self.active_backup_drive_keys
+                    )
+                    existing_folders = [
+                        os.path.basename(d)
+                        for d in planned_dest_dirs.values()
+                        if os.path.exists(d)
+                    ]
+                    if existing_folders:
                         # TODO: Find best wording, then add to translation files
                         ErrorMessageModalPopup(
                             self.builder,
                             "There already exists a folder with the same name: {folder}\n\nPlease select a different name for the backup image.".format(
-                                folder=folder_name
+                                folder=", ".join(existing_folders)
                             ),
                         )
                     else:
-                        print("User selected: " + dest_dir)
+                        print("User selected: " + str(list(planned_dest_dirs.values())))
                         self.dest_dir = dest_dir
+                        self.dest_dirs_by_drive = planned_dest_dirs
                         self.backup_notes = self.builder.get_object(
                             "backup_notes"
                         ).get_text()
@@ -591,16 +680,36 @@ class Handler:
                     self.builder.get_object("backup_tabs").set_current_page(7)
                     self.backup_manager.ui_manager.update_progress_bar(fraction=0)
                     is_rescue = self.get_rescue_state()
-                    self.backup_manager.start_backup(
-                        self.selected_drive_key,
-                        self.partitions_to_backup,
-                        self.drive_query.drive_state,
-                        self.dest_dir,
-                        self.backup_notes,
-                        self.compression_dict,
-                        is_rescue,
-                        self._on_operation_completed_callback,
-                    )
+                    if len(self.active_backup_drive_keys) > 1:
+                        backup_jobs = [
+                            (
+                                dk,
+                                self.partitions_to_backup_by_drive[dk],
+                                self.dest_dirs_by_drive[dk],
+                            )
+                            for dk in self.active_backup_drive_keys
+                        ]
+                        self.backup_manager.start_multi_drive_backup(
+                            backup_jobs=backup_jobs,
+                            drive_state=self.drive_query.drive_state,
+                            backup_notes=self.backup_notes,
+                            compression_dict=self.compression_dict,
+                            is_rescue=is_rescue,
+                            completed_backup_callback=self._on_operation_completed_callback,
+                        )
+                    else:
+                        self.backup_manager.start_backup(
+                            self.selected_drive_key,
+                            self.partitions_to_backup,
+                            self.drive_query.drive_state,
+                            self.dest_dirs_by_drive.get(
+                                self.selected_drive_key, self.dest_dir
+                            ),
+                            self.backup_notes,
+                            self.compression_dict,
+                            is_rescue,
+                            self._on_operation_completed_callback,
+                        )
                     # Disable back/next button until the restore completes
                     self.builder.get_object("button_next").set_sensitive(False)
                     self.builder.get_object("button_back").set_sensitive(False)
@@ -1358,6 +1467,17 @@ class Handler:
         self.next_tab(None)
         # Not using index = path.get_indices()[0], as the next button could also be used not double-click.
 
+    def backup_drive_toggled(self, cellrendertoggle, path):
+        print("Backup drive toggled: " + str(path))
+        iterator = self.drive_list_store.get_iter(path)
+        state = self.drive_list_store.get(iterator, 6)[0]
+        self.drive_list_store.set_value(iterator, 6, not state)
+
+    def row_activated_backup_drive_toggle(self, treeview, path, view_column):
+        iterator = self.drive_list_store.get_iter(path)
+        state = self.drive_list_store.get(iterator, 6)[0]
+        self.drive_list_store.set_value(iterator, 6, not state)
+
     def save_partition_toggled(self, cellrendertoggle, path):
         print("Backup partition oggled: " + str(path))
         iterator = self.save_partition_list_store.get_iter(path)
@@ -1920,7 +2040,14 @@ class Handler:
         self.drive_query.set_show_hidden_information(new_state)
         # Refresh the tables.
         # FIXME: Not ideal from an abstraction perspective
-        if self.selected_drive_key is not None:
+        if self.selected_drive_keys:
+            self.drive_query.populate_partition_selection_table(
+                self.selected_drive_keys
+            )
+            self.drive_query.populate_mount_partition_table(
+                ignore_drive_keys=self.selected_drive_keys
+            )
+        elif self.selected_drive_key is not None:
             self.drive_query.populate_partition_selection_table(self.selected_drive_key)
             self.drive_query.populate_mount_partition_table(
                 ignore_drive_key=self.selected_drive_key
@@ -1969,28 +2096,7 @@ class Handler:
             self.image_folder_query.query_folder(text)
 
     def confirm_backup_configuration(self):
-        number = GObject.markup_escape_text(
-            self.selected_drive_enduser_friendly_drive_number
-        )
-        _device = GObject.markup_escape_text(self.selected_drive_key)
-        size = GObject.markup_escape_text(self.selected_drive_capacity)
-        if self.selected_drive_model is None:
-            model = ""
-        else:
-            model = GObject.markup_escape_text(self.selected_drive_model)
         description = GObject.markup_escape_text(self.destination_partition_description)
-        partition_list_string = ""
-        for key in self.partitions_to_backup.keys():
-            partition_list_string += (
-                "    "
-                + GObject.markup_escape_text(key)
-                + ":  "
-                + GObject.markup_escape_text(
-                    self.partitions_to_backup[key]["description"]
-                )
-                + "\n"
-            )
-
         compression_string = (
             "<b>"
             + _("Compression format: ")
@@ -2000,18 +2106,81 @@ class Handler:
             + _("Compression level: ")
             + str(self.compression_dict["level"])
         )
-
         source_drive_heading = GObject.markup_escape_text(_("Source drive"))
         backup_partitions_heading = GObject.markup_escape_text(
             _("Backing up the following partition(s)")
         )
-        backup_image_destination_heading = GObject.markup_escape_text(
-            _(
-                "The backup image will be written into folder {dest_dir} on {description}"
-            ).format(dest_dir=self.dest_dir, description=description)
-        )
 
-        text_to_display = f"""
+        active_drives = self.active_backup_drive_keys or self.selected_drive_keys
+        if len(active_drives) > 1:
+            sections = []
+            total = len(active_drives)
+            for idx, dk in enumerate(active_drives, start=1):
+                meta = self.selected_drives_meta.get(dk, {})
+                number = GObject.markup_escape_text(meta.get("number", dk) or dk)
+                size = GObject.markup_escape_text(meta.get("capacity", "") or "")
+                raw_model = meta.get("model")
+                model = (
+                    "" if raw_model is None else GObject.markup_escape_text(raw_model)
+                )
+                drive_parts = self.partitions_to_backup_by_drive.get(dk, {})
+                part_lines = ""
+                for pkey, pval in drive_parts.items():
+                    part_lines += (
+                        "    "
+                        + GObject.markup_escape_text(pkey)
+                        + ":  "
+                        + GObject.markup_escape_text(pval["description"])
+                        + "\n"
+                    )
+                dest_line = GObject.markup_escape_text(
+                    _(
+                        "The backup image will be written into folder {dest_dir} on {description}"
+                    ).format(
+                        dest_dir=self.dest_dirs_by_drive.get(dk, self.dest_dir),
+                        description=self.destination_partition_description,
+                    )
+                )
+                sections.append(
+                    f"<b>[{idx}/{total}] {source_drive_heading}</b> {number} [{size}] ({model})\n"
+                    f"<b>{backup_partitions_heading}</b>:\n"
+                    f"{part_lines}"
+                    f"<b>{dest_line}</b>"
+                )
+            text_to_display = (
+                "\n" + "\n\n".join(sections) + f"\n\n{compression_string}\n"
+            )
+        else:
+            number = GObject.markup_escape_text(
+                self.selected_drive_enduser_friendly_drive_number
+            )
+            _device = GObject.markup_escape_text(self.selected_drive_key)
+            size = GObject.markup_escape_text(self.selected_drive_capacity)
+            if self.selected_drive_model is None:
+                model = ""
+            else:
+                model = GObject.markup_escape_text(self.selected_drive_model)
+            partition_list_string = ""
+            for key in self.partitions_to_backup.keys():
+                partition_list_string += (
+                    "    "
+                    + GObject.markup_escape_text(key)
+                    + ":  "
+                    + GObject.markup_escape_text(
+                        self.partitions_to_backup[key]["description"]
+                    )
+                    + "\n"
+                )
+            target_dir = self.dest_dirs_by_drive.get(
+                self.selected_drive_key, self.dest_dir
+            )
+            backup_image_destination_heading = GObject.markup_escape_text(
+                _(
+                    "The backup image will be written into folder {dest_dir} on {description}"
+                ).format(dest_dir=target_dir, description=description)
+            )
+
+            text_to_display = f"""
 <b>{source_drive_heading}</b> {number} [{size}] ({model})
 
 <b>{backup_partitions_heading}</b>:

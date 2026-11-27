@@ -2,6 +2,9 @@
 #   Copyright (C) 2012 RedoBackup.org
 #   Copyright (C) 2003-2025 Steven Shiau <steven _at_ clonezilla org>
 #   Copyright (C) 2019-2025 Rescuezilla.com <rescuezilla@gmail.com>
+#   Modified 2026-11-27 (Community Fork): Added multi-disk backup selection
+#   checkbox support, multi-drive partition table population, and multi-drive
+#   exclusion in destination mount partition table (GPL-3.0-or-later).
 # ----------------------------------------------------------------------
 #   This program is free software: you can redistribute it and/or modify
 #   it under the terms of the GNU General Public License as published by
@@ -19,6 +22,7 @@
 import collections
 import json
 import pprint
+import re
 import sys
 import threading
 import traceback
@@ -92,6 +96,12 @@ class DriveQuery:
             )
 
     def populate_drive_selection_table(self):
+        previously_checked = set()
+        n_cols = self.drive_list_store.get_n_columns()
+        if n_cols > 6:
+            for row in self.drive_list_store:
+                if row[6]:
+                    previously_checked.add(row[0])
         self.drive_list_store.clear()
         index = 0
         for drive_key in self.drive_state.keys():
@@ -143,6 +153,7 @@ class DriveQuery:
                         drive["model"],
                         drive["serial"],
                         flattened_partition_list,
+                        drive_key in previously_checked,
                     ]
                 )
                 index = index + 1
@@ -156,47 +167,77 @@ class DriveQuery:
             self.please_wait_popup.destroy()
             self.please_wait_popup = None
 
-    def populate_partition_selection_table(self, drive_key):
-        print("Received drive key " + drive_key)
+    def populate_partition_selection_table(self, drive_key_or_keys):
+        if isinstance(drive_key_or_keys, str):
+            drive_keys = [drive_key_or_keys]
+        else:
+            drive_keys = list(drive_key_or_keys)
+        print("Received drive key(s) " + str(drive_keys))
         print("drive state is " + str(self.drive_state))
         self.save_partition_list_store.clear()
 
+        is_multi_drive = len(drive_keys) > 1
         try:
-            if "partitions" in self.drive_state[drive_key].keys():
-                for partition_key in self.drive_state[drive_key]["partitions"].keys():
+            for drive_key in drive_keys:
+                short_drive = re.sub(r"^/dev/", "", drive_key)
+                prefix = f"[{short_drive}] " if is_multi_drive else ""
+                if "partitions" in self.drive_state[drive_key].keys():
+                    for partition_key in self.drive_state[drive_key][
+                        "partitions"
+                    ].keys():
+                        flattened_partition_description = (
+                            CombinedDriveState.flatten_partition_description(
+                                self.drive_state, drive_key, partition_key
+                            )
+                        )
+                        # Add row that's ticked, storing parent drive_key in col 3
+                        self.save_partition_list_store.append(
+                            [
+                                partition_key,
+                                True,
+                                prefix + flattened_partition_description,
+                                drive_key,
+                            ]
+                        )
+                else:
+                    # Add the drive itself
                     flattened_partition_description = (
                         CombinedDriveState.flatten_partition_description(
-                            self.drive_state, drive_key, partition_key
+                            self.drive_state, drive_key, drive_key
                         )
                     )
-                    # Add row that's ticked
+                    # Add row that's ticked, storing parent drive_key in col 3
                     self.save_partition_list_store.append(
-                        [partition_key, True, flattened_partition_description]
+                        [
+                            drive_key,
+                            True,
+                            prefix + flattened_partition_description,
+                            drive_key,
+                        ]
                     )
-            else:
-                # Add the drive itself
-                flattened_partition_description = (
-                    CombinedDriveState.flatten_partition_description(
-                        self.drive_state, drive_key, drive_key
-                    )
-                )
-                # Add row that's ticked
-                self.save_partition_list_store.append(
-                    [drive_key, True, flattened_partition_description]
-                )
         except Exception:
             tb = traceback.format_exc()
             traceback.print_exc()
             ErrorMessageModalPopup.display_nonfatal_warning_message(self.builder, tb)
         return
 
-    def populate_mount_partition_table(self, ignore_drive_key=None):
+    def populate_mount_partition_table(
+        self, ignore_drive_key=None, ignore_drive_keys=None
+    ):
         print("drive state is " + str(self.drive_state))
+        ignored_drives = set()
+        if ignore_drive_key is not None:
+            if isinstance(ignore_drive_key, str):
+                ignored_drives.add(ignore_drive_key)
+            else:
+                ignored_drives.update(ignore_drive_key)
+        if ignore_drive_keys is not None:
+            ignored_drives.update(ignore_drive_keys)
         self.mount_partition_list_store.clear()
         index = 0
         for drive_key in self.drive_state.keys():
             try:
-                if drive_key == ignore_drive_key or "nbd" in drive_key:
+                if drive_key in ignored_drives or "nbd" in drive_key:
                     continue
                 if "partitions" not in self.drive_state[drive_key].keys():
                     continue

@@ -355,16 +355,52 @@ class BackupManager:
             if (
                 self.requested_stop
                 and cmd_list
-                and cmd_list[0]
-                in (
-                    "os-prober",
-                    "linux-boot-prober",
-                )
+                and cmd_list[0] in ("os-prober", "linux-boot-prober")
             ):
-                # M-A: If os-prober was interrupted mid-probe, lazily clean up its temporary
-                # mount point so no stale FUSE/grub-mount remains on the Live system.
+                # M-A: os-prober spawns FUSE `grub-mount <dev> /var/lib/os-prober/mount` which
+                # daemonizes out of os-prober's process group. Unmount synchronously first (so
+                # FUSE gets DESTROY and exits cleanly), then terminate any detached grub-mount
+                # targeting /var/lib/os-prober/mount so zero stale mounts or FUSE daemons remain.
                 os_prober_mnt = "/var/lib/os-prober/mount"
-                if os.path.ismount(os_prober_mnt):
+                for _attempt in range(4):
+                    if os.path.exists(os_prober_mnt):
+                        try:
+                            res_u = subprocess.run(
+                                ["umount", os_prober_mnt],
+                                check=False,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                timeout=5.0,
+                            )
+                            if res_u.returncode != 0 and os.path.ismount(os_prober_mnt):
+                                subprocess.run(
+                                    ["umount", "-l", os_prober_mnt],
+                                    check=False,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                    timeout=5.0,
+                                )
+                        except Exception:
+                            pass
+                    try:
+                        res_pk = subprocess.run(
+                            [
+                                "pkill",
+                                "-TERM",
+                                "-f",
+                                "grub-mount.*/var/lib/os-prober/mount",
+                            ],
+                            check=False,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=3.0,
+                        )
+                    except Exception:
+                        break
+                    if res_pk.returncode != 0 and not os.path.ismount(os_prober_mnt):
+                        break
+                    sleep(0.2)
+                if os.path.exists(os_prober_mnt) and os.path.ismount(os_prober_mnt):
                     try:
                         subprocess.run(
                             ["umount", "-l", os_prober_mnt],
@@ -375,6 +411,21 @@ class BackupManager:
                         )
                     except Exception:
                         pass
+                try:
+                    subprocess.run(
+                        [
+                            "pkill",
+                            "-KILL",
+                            "-f",
+                            "grub-mount.*/var/lib/os-prober/mount",
+                        ],
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=3.0,
+                    )
+                except Exception:
+                    pass
 
         if self.requested_stop:
             raise _BackupCancelledError()

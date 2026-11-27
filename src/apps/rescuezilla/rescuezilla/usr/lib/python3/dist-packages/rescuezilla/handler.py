@@ -1474,6 +1474,12 @@ class Handler:
         self.drive_list_store.set_value(iterator, 6, not state)
 
     def row_activated_backup_drive_toggle(self, treeview, path, view_column):
+        # If the user double-clicked directly on the checkbox column, the
+        # CellRendererToggle 'toggled' signal already handled it; avoid toggling twice.
+        if view_column is not None and any(
+            isinstance(cell, Gtk.CellRendererToggle) for cell in view_column.get_cells()
+        ):
+            return
         iterator = self.drive_list_store.get_iter(path)
         state = self.drive_list_store.get(iterator, 6)[0]
         self.drive_list_store.set_value(iterator, 6, not state)

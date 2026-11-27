@@ -26,7 +26,9 @@ import glob
 import os
 import pprint
 import shutil
+import signal
 import subprocess
+import tempfile
 import threading
 import traceback
 from datetime import datetime
@@ -46,6 +48,16 @@ from parser.swappt import Swappt
 from utility import Utility, _
 
 
+def normalize_drive_key(drive_key: str) -> str:
+    """Normalize a Linux block device specifier to canonical '/dev/...' form."""
+    raw = str(drive_key).strip()
+    if not raw:
+        raise ValueError("Drive key must not be empty")
+    if not raw.startswith("/"):
+        raw = "/dev/" + raw
+    return os.path.normpath(raw)
+
+
 def sanitize_drive_suffix(drive_key: str) -> str:
     """Return a clean filename-safe short device name (e.g. '/dev/nvme0n1' -> 'nvme0n1')."""
     short = re.sub(r"^/dev/", "", str(drive_key).strip())
@@ -61,12 +73,20 @@ def compute_backup_dest_dirs(
     - Single selected drive: keeps exact base_dest_dir (100% identical to upstream).
     - Multiple selected drives: appends '-<short_drive_name>' to base_dest_dir for each drive,
       producing standalone upstream-compatible Rescuezilla/Clonezilla backup folders.
+    - Duplicate drives (including unnormalized aliases like '/dev/sda' and 'sda') raise ValueError.
     """
     keys = (
         [selected_drive_keys]
         if isinstance(selected_drive_keys, str)
         else list(selected_drive_keys)
     )
+    seen_norm = set()
+    for dk in keys:
+        norm = normalize_drive_key(dk)
+        if norm in seen_norm:
+            raise ValueError(f"Duplicate source drive specified: {dk} ({norm})")
+        seen_norm.add(norm)
+
     result = collections.OrderedDict()
     if len(keys) <= 1:
         for dk in keys:
@@ -88,6 +108,69 @@ def compute_backup_dest_dirs(
         used.add(candidate)
         result[dk] = candidate
     return result
+
+
+def prepare_cli_backup_jobs(
+    drive_state: Dict[str, Any], raw_sources, raw_partitions, destination: str
+):
+    """Validate and normalize CLI backup sources/partitions into backup_jobs tuples.
+
+    Returns a list of (drive_key, partitions_to_backup, dest_dir) tuples.
+    Raises ValueError before any directory is created if sources are duplicated/unknown
+    or if explicit --partitions cannot be cleanly mapped to the selected drives.
+    """
+    src_list = [raw_sources] if isinstance(raw_sources, str) else list(raw_sources)
+    if not src_list:
+        raise ValueError("At least one source drive must be specified.")
+    norm_sources = [normalize_drive_key(dk) for dk in src_list]
+    # Validates uniqueness across normalized names and builds per-drive destination paths.
+    dest_dirs = compute_backup_dest_dirs(destination, norm_sources)
+
+    for dk in norm_sources:
+        if dk not in drive_state:
+            raise ValueError(f"Source drive not found in system drive list: {dk}")
+        if "partitions" not in drive_state[dk]:
+            raise ValueError(f"Source drive {dk} has no partition table or filesystem.")
+
+    is_all = raw_partitions == "all" or (
+        isinstance(raw_partitions, list)
+        and (len(raw_partitions) == 0 or "all" in raw_partitions)
+    )
+    if is_all:
+        return [(dk, ["all"], dest_dirs[dk]) for dk in norm_sources]
+
+    req_parts = (
+        [raw_partitions] if isinstance(raw_partitions, str) else list(raw_partitions)
+    )
+    norm_req_parts = [normalize_drive_key(p) for p in req_parts]
+    matched_req = set()
+    jobs = []
+    for dk in norm_sources:
+        drive_parts = drive_state[dk]["partitions"]
+        selected_parts = collections.OrderedDict()
+        for pk in norm_req_parts:
+            if pk in drive_parts:
+                part_entry = dict(drive_parts[pk])
+                part_entry["description"] = (
+                    CombinedDriveState.flatten_partition_description(
+                        drive_state, dk, pk
+                    )
+                )
+                selected_parts[pk] = part_entry
+                matched_req.add(pk)
+        if not selected_parts:
+            raise ValueError(
+                f"No requested partitions {norm_req_parts} belong to selected source drive {dk}. "
+                "Use --partitions all for multi-drive backups or specify partitions for every selected drive."
+            )
+        jobs.append((dk, selected_parts, dest_dirs[dk]))
+
+    unmatched = [p for p in norm_req_parts if p not in matched_req]
+    if unmatched:
+        raise ValueError(
+            f"Requested partition(s) not found on selected source drive(s): {', '.join(unmatched)}"
+        )
+    return jobs
 
 
 class _BatchDriveUiProxy:
@@ -164,6 +247,10 @@ class _BatchDriveUiProxy:
         return
 
 
+class _BackupCancelledError(Exception):
+    """Internal control-flow signal raised when user cancels during a metadata command."""
+
+
 # Signals should automatically propagate to processes called with subprocess.run().
 # TODO: This class uses 'subprocess.call', which provides exit code but not stdout/stderr. It would be
 # TODO: VERY useful to display stdout/stderr when the exit code is non-zero, like the RestoreManager does.
@@ -174,11 +261,210 @@ class BackupManager:
         self.backup_in_progress = False
         self.human_readable_version = human_readable_version
         # proc dictionary
+        self._proc_lock = threading.Lock()
         self.proc = collections.OrderedDict()
+        self._pgroup_pids = set()
         self.logger = None
 
         self.requested_stop = False
         self._is_batch_mode = False
+        self._single_backup_completed = False
+        self.failed_partition_count = 0
+        self.succeeded_partition_count = 0
+
+    def _log(self, message: str):
+        logger = self.logger
+        if logger is not None:
+            try:
+                logger.write(message)
+            except Exception:
+                print(message)
+
+    def _run_cancellable(
+        self,
+        short_description,
+        cmd_list,
+        use_c_locale,
+        output_filepath=None,
+        logger=None,
+    ):
+        """Drop-in cancellable replacement for Utility.run() during backup metadata collection.
+
+        Registers the active subprocess in self.proc['_active_cmd'] (with its own session/pgid)
+        so cancel_backup() terminates slow commands (smartctl, os-prober, lshw, etc.) immediately.
+        """
+        if self.requested_stop:
+            raise _BackupCancelledError()
+        if use_c_locale:
+            env = Utility.get_env_C_locale()
+        else:
+            env = os.environ.copy()
+        flat_command_string = Utility.print_cli_friendly(short_description, [cmd_list])
+        proc = subprocess.Popen(
+            cmd_list,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            start_new_session=True,
+        )
+        registered = False
+        already_cancelled = False
+        try:
+            with self._proc_lock:
+                if self.requested_stop:
+                    already_cancelled = True
+                else:
+                    self.proc["_active_cmd"] = proc
+                    self._pgroup_pids.add(proc.pid)
+                    registered = True
+
+            if already_cancelled:
+                # Terminate and reap OUTSIDE self._proc_lock so GUI cancel_backup() never blocks.
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except Exception:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                try:
+                    proc.communicate(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    try:
+                        proc.communicate(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        pass
+                raise _BackupCancelledError()
+
+            stdout_data, stderr_data = proc.communicate()
+        finally:
+            if registered:
+                with self._proc_lock:
+                    if self.proc.get("_active_cmd") is proc:
+                        del self.proc["_active_cmd"]
+                    self._pgroup_pids.discard(proc.pid)
+            if (
+                self.requested_stop
+                and cmd_list
+                and cmd_list[0]
+                in (
+                    "os-prober",
+                    "linux-boot-prober",
+                )
+            ):
+                # M-A: If os-prober was interrupted mid-probe, lazily clean up its temporary
+                # mount point so no stale FUSE/grub-mount remains on the Live system.
+                os_prober_mnt = "/var/lib/os-prober/mount"
+                if os.path.ismount(os_prober_mnt):
+                    try:
+                        subprocess.run(
+                            ["umount", "-l", os_prober_mnt],
+                            check=False,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=5.0,
+                        )
+                    except Exception:
+                        pass
+
+        if self.requested_stop:
+            raise _BackupCancelledError()
+
+        completed = subprocess.CompletedProcess(
+            cmd_list, proc.returncode, stdout_data, stderr_data
+        )
+        logging_output = (
+            short_description
+            + ": "
+            + flat_command_string
+            + " returned "
+            + str(completed.returncode)
+            + ": "
+            + completed.stdout
+            + " "
+            + completed.stderr
+            + "\n"
+        )
+        if logger is None:
+            print(logging_output)
+        else:
+            logger.write(logging_output)
+
+        if output_filepath is not None:
+            with open(output_filepath, "a+") as filehandle:
+                filehandle.write("%s" % completed.stdout)
+                filehandle.flush()
+
+        fail_description = (
+            _("Failed to run command: ")
+            + flat_command_string
+            + "\n\n"
+            + completed.stdout
+            + "\n"
+            + completed.stderr
+            + "\n\n"
+        )
+        return completed, flat_command_string, fail_description
+
+    def _terminate_and_wait_partition_procs(self, partition_key: str):
+        """Terminate and reap partclone/compression/split procs for one partition."""
+        proc_names = [
+            "partclone_backup_" + partition_key,
+            "compression_" + partition_key,
+            "split_" + partition_key,
+        ]
+        procs = []
+        with self._proc_lock:
+            for name in proc_names:
+                p = self.proc.get(name)
+                if p is not None:
+                    procs.append(p)
+        for p in procs:
+            try:
+                if p.poll() is None:
+                    p.terminate()
+            except Exception:
+                pass
+        for p in procs:
+            try:
+                if p.poll() is None:
+                    p.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                try:
+                    p.kill()
+                    p.wait(timeout=2.0)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            for pipe in (p.stdout, p.stderr):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
+
+    def _remove_partition_output_files(self, filepath: str, seekidx_path=None):
+        """Delete partial or failed partition image splits and .rzidx using glob.escape."""
+        failed_paths = glob.glob(glob.escape(filepath) + "*")
+        if seekidx_path is not None:
+            failed_paths.extend(glob.glob(glob.escape(seekidx_path) + "*"))
+        for file_path in failed_paths:
+            try:
+                os.remove(file_path)
+            except OSError:
+                self._log("Unable to remove: " + file_path)
+                with self.summary_message_lock:
+                    self.summary_message += "Unable to remove: " + file_path + "\n"
 
     def is_backup_in_progress(self):
         with self.backup_in_progress_lock:
@@ -210,7 +496,10 @@ class BackupManager:
         # TODO: clear abstractions is important for ensuring correctness of the backup/restore operation
         self.drive_state = drive_state
         self.ui_manager.update_progress_bar(fraction=0)
+        self.requested_stop = False
         with self.backup_in_progress_lock:
+            self._is_batch_mode = False
+            self._single_backup_completed = False
             self.backup_in_progress = True
         self.metadata_only_image_to_annotate = metadata_only_image_to_annotate
         self.is_cloning = False
@@ -268,11 +557,11 @@ class BackupManager:
         self.metadata_only_image_to_annotate = None
         self.is_cloning = False
         self.requested_stop = False
-        self._is_batch_mode = True
         self.summary_message_lock = threading.Lock()
         self.summary_message = ""
         self.ui_manager.update_progress_bar(fraction=0)
         with self.backup_in_progress_lock:
+            self._is_batch_mode = True
             self.backup_in_progress = True
 
         if on_separate_thread:
@@ -327,6 +616,8 @@ class BackupManager:
             self.partitions_to_backup = partitions_to_backup
             self.dest_dir = dest_dir
             self.logger = None
+            self.failed_partition_count = 0
+            self.succeeded_partition_count = 0
             drive_succeeded = False
             drive_err_msg = ""
 
@@ -340,6 +631,9 @@ class BackupManager:
                     drive_err_msg = str(ret[1] or "")
                 else:
                     drive_succeeded = True
+                # Never treat a drive with failed partitions as succeeded in batch summary.
+                if self.failed_partition_count > 0:
+                    drive_succeeded = False
             except Exception:
                 tb = traceback.format_exc()
                 traceback.print_exc()
@@ -347,7 +641,10 @@ class BackupManager:
                 drive_err_msg = _("Error creating backup: ") + tb
             finally:
                 try:
-                    self._finalize_clonezilla_img_and_id(dest_dir=dest_dir)
+                    self._finalize_clonezilla_img_and_id(
+                        dest_dir=dest_dir,
+                        write_img_id=(drive_succeeded and not self.requested_stop),
+                    )
                 except Exception:
                     traceback.print_exc()
                 self.ui_manager = real_ui
@@ -394,13 +691,13 @@ class BackupManager:
         )
         self.at_least_one_non_fatal_error = had_any_non_fatal
         self.summary_message_lock = threading.Lock()
-        header = (
-            f"Multi-drive backup: {succeeded_count}/{total_drives} drive(s) succeeded"
+        header = _("Multi-drive backup: {succeeded}/{total} drive(s) succeeded").format(
+            succeeded=succeeded_count, total=total_drives
         )
         if failed_count > 0:
-            header += f", {failed_count} failed"
+            header += ", " + _("{failed} failed").format(failed=failed_count)
         if cancelled:
-            header += " (cancelled)"
+            header += " (" + _("cancelled") + ")"
         self.summary_message = header + "\n\n" + "\n\n".join(batch_sections) + "\n"
         if overall_succeeded:
             real_ui.update_progress_bar(fraction=1.0)
@@ -412,108 +709,111 @@ class BackupManager:
         )
 
     def _completed_multi_drive_backup(self, succeeded, message):
-        self.ui_manager.update_progress_status(message="")
-        self.ui_manager.remove_all_main_statusbar(context_id="backup")
-        backup_timeend = datetime.now()
-        duration_minutes = Utility.get_human_readable_minutes_seconds(
-            (backup_timeend - self.backup_timestart).total_seconds()
-        )
-        duration_message = _("Operation took {num_minutes} minutes.").format(
-            num_minutes=duration_minutes
-        )
+        callback_succeeded = succeeded
+        try:
+            self.ui_manager.update_progress_status(message="")
+            self.ui_manager.remove_all_main_statusbar(context_id="backup")
+            backup_timeend = datetime.now()
+            duration_minutes = Utility.get_human_readable_minutes_seconds(
+                (backup_timeend - self.backup_timestart).total_seconds()
+            )
+            duration_message = _("Operation took {num_minutes} minutes.").format(
+                num_minutes=duration_minutes
+            )
 
-        with self.summary_message_lock:
-            if succeeded:
-                if not self.at_least_one_non_fatal_error:
-                    self.summary_message = (
-                        _("Backup saved successfully.")
-                        + "\n\n"
-                        + self.summary_message
-                        + "\n"
-                    )
-                else:
-                    self.summary_message = (
-                        _("Backup succeeded with some errors:")
-                        + "\n\n"
-                        + self.summary_message
-                        + "\n"
-                    )
-            else:
-                heading = _("Backup operation failed:")
-                extra = ("\n\n" + message) if message else ""
-                self.summary_message = (
-                    heading + "\n\n" + self.summary_message + extra + "\n"
-                )
-                self.ui_manager.display_error_message(
-                    summary_message=self.summary_message, heading=heading
-                )
+            is_unmounted, umount_message = Utility.umount_warn_on_busy(
+                "/mnt/backup", is_lazy_umount=True
+            )
+            if not is_unmounted:
+                print(umount_message)
 
-            self.summary_message += duration_message + "\n"
-            post_task_action: str = self.ui_manager.get_post_task_action()
-            if post_task_action != "DO_NOTHING":
-                if succeeded:
-                    has_scheduled, msg = Utility.schedule_shutdown_reboot(
-                        post_task_action
-                    )
-                    self.summary_message += "\n" + msg
-                else:
-                    self.summary_message += "\n" + _(
-                        "Shutdown/Reboot cancelled due to errors."
-                    )
-
-        self.populate_summary_page()
-
-        is_unmounted, umount_message = Utility.umount_warn_on_busy(
-            "/mnt/backup", is_lazy_umount=True
-        )
-        if not is_unmounted:
-            print(umount_message)
             with self.summary_message_lock:
-                self.summary_message += umount_message + "\n"
+                if succeeded:
+                    if not self.at_least_one_non_fatal_error:
+                        self.summary_message = (
+                            _("Backup saved successfully.")
+                            + "\n\n"
+                            + self.summary_message
+                            + "\n"
+                        )
+                    else:
+                        self.summary_message = (
+                            _("Backup succeeded with some errors:")
+                            + "\n\n"
+                            + self.summary_message
+                            + "\n"
+                        )
+                else:
+                    heading = _("Backup operation failed:")
+                    extra = ("\n\n" + message) if message else ""
+                    self.summary_message = (
+                        heading + "\n\n" + self.summary_message + extra + "\n"
+                    )
+                    self.ui_manager.display_error_message(
+                        summary_message=self.summary_message, heading=heading
+                    )
 
-        with self.backup_in_progress_lock:
-            self._is_batch_mode = False
-            self.backup_in_progress = False
-        self.completed_backup_callback(succeeded)
+                if not is_unmounted and umount_message:
+                    self.summary_message += umount_message + "\n"
+
+                self.summary_message += duration_message + "\n"
+                post_task_action: str = self.ui_manager.get_post_task_action()
+                if post_task_action != "DO_NOTHING":
+                    if succeeded:
+                        has_scheduled, msg = Utility.schedule_shutdown_reboot(
+                            post_task_action
+                        )
+                        self.summary_message += "\n" + msg
+                    else:
+                        self.summary_message += "\n" + _(
+                            "Shutdown/Reboot cancelled due to errors."
+                        )
+
+            self.populate_summary_page()
+        except Exception:
+            callback_succeeded = False
+            raise
+        finally:
+            with self.backup_in_progress_lock:
+                self._is_batch_mode = False
+                self.backup_in_progress = False
+            self.completed_backup_callback(callback_succeeded)
 
     # Intended to be called via event thread
-    # Sending signals to process objects on its own thread. Relying on Python GIL.
-    # TODO: Threading practices here need overhaul. Use threading.Lock() instead of GIL
     def cancel_backup(self):
-        # Again, relying on GIL.
         self.requested_stop = True
-        if len(self.proc) == 0:
-            if self.logger is not None:
-                self.logger.write("Nothing to cancel")
+        try:
+            self.ui_manager.update_progress_status(
+                message=_("Stopping backup operation...")
+            )
+        except Exception:
+            pass
+        with self._proc_lock:
+            active_procs = list(self.proc.items())
+            pgroup_pids = set(self._pgroup_pids)
+        if len(active_procs) == 0:
+            self._log("Nothing to cancel")
         else:
-            if self.logger is not None:
-                self.logger.write(
-                    "Will send cancel signal to " + str(len(self.proc)) + " processes."
-                )
-            for key in list(self.proc.keys()):
-                process = self.proc[key]
+            self._log(
+                "Will send cancel signal to " + str(len(active_procs)) + " processes."
+            )
+            for _key, process in active_procs:
                 try:
-                    if self.logger is not None:
-                        self.logger.write("Sending SIGTERM to " + str(process))
-                    # Send SIGTERM
+                    self._log("Sending SIGTERM to " + str(process))
+                    pid = getattr(process, "pid", None)
+                    if pid is not None and pid in pgroup_pids:
+                        try:
+                            os.killpg(pid, signal.SIGTERM)
+                            continue
+                        except Exception:
+                            pass
                     process.terminate()
                 except Exception:
-                    if self.logger is not None:
-                        self.logger.write(
-                            "Error killing process. (Maybe already dead?)"
-                        )
-        if self._is_batch_mode:
-            # Let the batch worker thread finish tearing down the active drive,
-            # unmount /mnt/backup once, and fire _completed_multi_drive_backup once.
-            return
-        with self.backup_in_progress_lock:
-            self.backup_in_progress = False
-        if not self.is_cloning:
-            self.ui_manager.completed_operation(
-                callable_fn=self.completed_backup,
-                succeeded=False,
-                message=_("Operation cancelled by user."),
-            )
+                    self._log("Error killing process. (Maybe already dead?)")
+        # Both batch and single-drive worker threads observe self.requested_stop,
+        # terminate/reap active subprocesses, clean up partial files, unmount
+        # /mnt/backup once, and invoke the completion callback exactly once.
+        return
 
     def do_backup_wrapper(self):
         try:
@@ -544,15 +844,30 @@ class BackupManager:
         return to_return
 
     def do_backup(self):
+        try:
+            return self._do_backup_inner()
+        except _BackupCancelledError:
+            self.ui_manager.completed_operation(
+                callable_fn=self.completed_backup,
+                succeeded=False,
+                message=_("User requested operation to stop."),
+            )
+            return False, _("User requested operation to stop.")
+
+    def _do_backup_inner(self):
         pp = pprint.PrettyPrinter(indent=4)
         pp.pprint(self.partitions_to_backup)
         self.at_least_one_non_fatal_error = False
-        if not self._is_batch_mode:
-            self.requested_stop = False
-        # Clear proc dictionary
-        self.proc.clear()
+        self.failed_partition_count = 0
+        self.succeeded_partition_count = 0
+        # Clear proc dictionary under lock
+        with self._proc_lock:
+            self.proc.clear()
+            self._pgroup_pids.clear()
         self.summary_message_lock = threading.Lock()
         self.summary_message = ""
+        if self.requested_stop:
+            raise _BackupCancelledError()
 
         # partitions_to_backup is normally dictionary, except when it's set by the CLI argument then it's a list.
         # TODO: this is a silly quick-fix and the CLI argument should be refactored.
@@ -634,7 +949,7 @@ class BackupManager:
                 self.ui_manager.display_status(
                     msg1=_("Saving: {file}").format(file=mdadm_conf_filepath), msg2=""
                 )
-                process, flat_command_string, failed_message = Utility.run(
+                process, flat_command_string, failed_message = self._run_cancellable(
                     "Saving mdadm.conf",
                     ["mdadm", "--detail", "--scan"],
                     use_c_locale=True,
@@ -658,18 +973,20 @@ class BackupManager:
                         ),
                         msg2="",
                     )
-                    process, flat_command_string, failed_message = Utility.run(
-                        "Saving " + raid_device_query_filepath,
-                        [
-                            "mdadm",
-                            "--query",
-                            "--detail",
-                            "--export",
-                            "/dev/" + raid_dev_key,
-                        ],
-                        use_c_locale=True,
-                        output_filepath=raid_device_query_filepath,
-                        logger=self.logger,
+                    process, flat_command_string, failed_message = (
+                        self._run_cancellable(
+                            "Saving " + raid_device_query_filepath,
+                            [
+                                "mdadm",
+                                "--query",
+                                "--detail",
+                                "--export",
+                                "/dev/" + raid_dev_key,
+                            ],
+                            use_c_locale=True,
+                            output_filepath=raid_device_query_filepath,
+                            logger=self.logger,
+                        )
                     )
                     if process.returncode != 0:
                         # Clonezilla doesn't handle non-zero return code, so to maximize compatibility Rescuezilla
@@ -697,7 +1014,7 @@ class BackupManager:
             self.ui_manager.display_status(
                 msg1=_("Saving: {file}").format(file=blkdev_list_filepath), msg2=""
             )
-            process, flat_command_string, failed_message = Utility.run(
+            process, flat_command_string, failed_message = self._run_cancellable(
                 "Saving blkdev.list",
                 [
                     "lsblk",
@@ -725,7 +1042,7 @@ class BackupManager:
             blkid_cmd_list = ["blkid"]
             sort_cmd_list = ["sort", "-V"]
             Utility.print_cli_friendly("blkid ", [blkid_cmd_list, sort_cmd_list])
-            process, flat_command_string, failed_message = Utility.run(
+            process, flat_command_string, failed_message = self._run_cancellable(
                 "Saving blkid.list",
                 ["blkid"],
                 use_c_locale=True,
@@ -746,7 +1063,7 @@ class BackupManager:
             self.ui_manager.display_status(
                 msg1=_("Saving: {file}").format(file=info_lshw_filepath), msg2=""
             )
-            process, flat_command_string, failed_message = Utility.run(
+            process, flat_command_string, failed_message = self._run_cancellable(
                 "Saving Info-lshw.txt",
                 ["lshw"],
                 use_c_locale=True,
@@ -774,7 +1091,7 @@ class BackupManager:
                     + ":\n"
                 )
                 filehandle.flush()
-            process, flat_command_string, failed_message = Utility.run(
+            process, flat_command_string, failed_message = self._run_cancellable(
                 "Saving Info-dmi.txt",
                 ["dmidecode"],
                 use_c_locale=True,
@@ -802,7 +1119,7 @@ class BackupManager:
                 filehandle.write("'lspci' results:\n")
                 filehandle.flush()
 
-            process, flat_command_string, failed_message = Utility.run(
+            process, flat_command_string, failed_message = self._run_cancellable(
                 "Appending `lspci` output to Info-lspci.txt",
                 ["lspci"],
                 use_c_locale=True,
@@ -828,7 +1145,7 @@ class BackupManager:
                 filehandle.flush()
 
             # Show PCI vendor and device codes as numbers instead of looking them up in the PCI ID list.
-            process, flat_command_string, failed_message = Utility.run(
+            process, flat_command_string, failed_message = self._run_cancellable(
                 "Appending `lspci -n` output to Info-lspci.txt",
                 ["lspci", "-n"],
                 use_c_locale=True,
@@ -861,7 +1178,7 @@ class BackupManager:
 
             # VirtualBox doesn't support smart, so ignoring the exit code here.
             # FIXME: Improve this.
-            process, flat_command_string, failed_message = Utility.run(
+            process, flat_command_string, failed_message = self._run_cancellable(
                 "Saving Info-smart.txt",
                 ["smartctl", "--all", self.selected_drive_key],
                 use_c_locale=True,
@@ -880,7 +1197,7 @@ class BackupManager:
                     + "\n"
                 )
                 filehandle.flush()
-            process, flat_command_string, failed_message = Utility.run(
+            process, flat_command_string, failed_message = self._run_cancellable(
                 "Running os-prober and appending output to Info-OS-prober.txt",
                 ["os-prober"],
                 use_c_locale=True,
@@ -901,7 +1218,7 @@ class BackupManager:
                 filehandle.flush()
 
             for partition_key in self.partitions_to_backup:
-                process, flat_command_string, failed_message = Utility.run(
+                process, flat_command_string, failed_message = self._run_cancellable(
                     "Running linux-boot-prober for " + partition_key,
                     ["linux-boot-prober", partition_key],
                     use_c_locale=True,
@@ -995,7 +1312,7 @@ class BackupManager:
             msg1=_("Saving: {file}").format(file=compact_parted_filepath), msg2=""
         )
         # Parted drive information with human-readable "compact" units: KB/MB/GB rather than sectors.
-        process, flat_command_string, failed_message = Utility.run(
+        process, flat_command_string, failed_message = self._run_cancellable(
             "Saving " + compact_parted_filepath,
             ["parted", "--script", self.selected_drive_key, "unit", "compact", "print"],
             use_c_locale=True,
@@ -1016,7 +1333,7 @@ class BackupManager:
         self.ui_manager.display_status(
             msg1=_("Saving: {file}").format(file=parted_filepath), msg2=""
         )
-        parted_process, flat_command_string, failed_message = Utility.run(
+        parted_process, flat_command_string, failed_message = self._run_cancellable(
             "Saving " + parted_filepath,
             ["parted", "--script", self.selected_drive_key, "unit", "s", "print"],
             use_c_locale=True,
@@ -1039,7 +1356,7 @@ class BackupManager:
             self.ui_manager.display_status(
                 msg1=_("Saving: {file}").format(file=efi_nvram_filepath), msg2=""
             )
-            process, flat_command_string, failed_message = Utility.run(
+            process, flat_command_string, failed_message = self._run_cancellable(
                 "Saving EFI NVRAM info",
                 ["efibootmgr", "--verbose"],
                 use_c_locale=True,
@@ -1069,7 +1386,7 @@ class BackupManager:
             self.ui_manager.display_status(
                 msg1=_("Saving: {file}").format(file=filepath), msg2=""
             )
-            process, flat_command_string, failed_message = Utility.run(
+            process, flat_command_string, failed_message = self._run_cancellable(
                 "Saving " + filepath,
                 [
                     "dd",
@@ -1098,7 +1415,7 @@ class BackupManager:
             self.ui_manager.display_status(
                 msg1=_("Saving: {file}").format(file=first_gpt_filename), msg2=""
             )
-            dd_process, flat_command_string, failed_message = Utility.run(
+            dd_process, flat_command_string, failed_message = self._run_cancellable(
                 "Saving " + first_gpt_filename,
                 [
                     "dd",
@@ -1139,7 +1456,7 @@ class BackupManager:
             self.ui_manager.display_status(
                 msg1=_("Saving: {file}").format(file=second_gpt_filename), msg2=""
             )
-            process, flat_command_string, failed_message = Utility.run(
+            process, flat_command_string, failed_message = self._run_cancellable(
                 "Saving " + second_gpt_filename,
                 [
                     "dd",
@@ -1167,7 +1484,7 @@ class BackupManager:
             self.ui_manager.display_status(
                 msg1=_("Saving: {file}").format(file=gdisk_filename), msg2=""
             )
-            process, flat_command_string, failed_message = Utility.run(
+            process, flat_command_string, failed_message = self._run_cancellable(
                 "Saving " + gdisk_filename,
                 [
                     "sgdisk",
@@ -1192,7 +1509,7 @@ class BackupManager:
             self.ui_manager.display_status(
                 msg1=_("Saving: {file}").format(file=sgdisk_filename), msg2=""
             )
-            process, flat_command_string, failed_message = Utility.run(
+            process, flat_command_string, failed_message = self._run_cancellable(
                 "Saving " + sgdisk_filename,
                 ["sgdisk", "--print", self.selected_drive_key],
                 use_c_locale=True,
@@ -1290,7 +1607,7 @@ class BackupManager:
             self.ui_manager.display_status(
                 msg1=_("Saving: {file}").format(file=hidden_mbr_data_filepath), msg2=""
             )
-            process, flat_command_string, failed_message = Utility.run(
+            process, flat_command_string, failed_message = self._run_cancellable(
                 "Saving " + hidden_mbr_data_filepath,
                 [
                     "dd",
@@ -1328,7 +1645,7 @@ class BackupManager:
             self.ui_manager.display_status(
                 msg1=_("Saving: {file}").format(file=sfdisk_filepath), msg2=""
             )
-            process, flat_command_string, failed_message = Utility.run(
+            process, flat_command_string, failed_message = self._run_cancellable(
                 "Saving " + sfdisk_filepath,
                 ["sfdisk", "--dump", self.selected_drive_key],
                 output_filepath=sfdisk_filepath,
@@ -1349,7 +1666,7 @@ class BackupManager:
         self.ui_manager.display_status(
             msg1=_("Saving: {file}").format(file=filepath), msg2=""
         )
-        process, flat_command_string, failed_message = Utility.run(
+        process, flat_command_string, failed_message = self._run_cancellable(
             "Retrieving disk geometry with sfdisk ",
             ["sfdisk", "--show-geometry", self.selected_drive_key],
             use_c_locale=True,
@@ -1462,7 +1779,7 @@ class BackupManager:
                             )
                             continue
                         file_command_process, flat_command_string, failed_message = (
-                            Utility.run(
+                            self._run_cancellable(
                                 "logical volume file info",
                                 ["file", "--dereference", "--special-files", lv_path],
                                 use_c_locale=True,
@@ -1540,7 +1857,7 @@ class BackupManager:
                             msg2="",
                         )
                         vgcfgbackup_process, flat_command_string, failed_message = (
-                            Utility.run(
+                            self._run_cancellable(
                                 "Saving LVM VG config " + lvm_vgname_filepath,
                                 ["vgcfgbackup", "--file", lvm_vgname_filepath, vg_name],
                                 use_c_locale=True,
@@ -1579,6 +1896,13 @@ class BackupManager:
 
         partition_number = 0
         for partition_key in self.partitions_to_backup.keys():
+            if self.requested_stop:
+                self.ui_manager.completed_operation(
+                    callable_fn=self.completed_backup,
+                    succeeded=False,
+                    message=_("User requested operation to stop."),
+                )
+                return False, _("User requested operation to stop.")
             self.ui_manager.display_status(msg1="", msg2="")
             partition_number += 1
             total_progress_float = Utility.calculate_progress_ratio(
@@ -1621,7 +1945,7 @@ class BackupManager:
                 self.ui_manager.display_status(
                     msg1=_("Saving: {file}").format(file=filepath), msg2=""
                 )
-                process, flat_command_string, failed_message = Utility.run(
+                process, flat_command_string, failed_message = self._run_cancellable(
                     "Saving " + filepath,
                     [
                         "dd",
@@ -1855,6 +2179,14 @@ class BackupManager:
                     filehandle.write(b"\x0012345678DEADBEEF")
                 continue
 
+            if self.requested_stop:
+                self.ui_manager.completed_operation(
+                    callable_fn=self.completed_backup,
+                    succeeded=False,
+                    message=_("User requested operation to stop."),
+                )
+                return False, _("User requested operation to stop.")
+
             filesystem_backup_message = _(
                 "Backup {partition_name} containing filesystem {filesystem} to {destination}"
             ).format(
@@ -1863,105 +2195,159 @@ class BackupManager:
                 destination=filepath,
             )
             self.ui_manager.update_main_statusbar(message=filesystem_backup_message)
-            self.logger.write(filesystem_backup_message)
+            self._log(filesystem_backup_message)
 
             flat_command_string = Utility.print_cli_friendly(
                 "Running ", [partclone_cmd_list, compression_cmd_list, split_cmd_list]
             )
-            self.proc["partclone_backup_" + partition_key] = subprocess.Popen(
-                partclone_cmd_list,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=env,
-                encoding="utf-8",
-            )
-
-            self.proc["compression_" + partition_key] = subprocess.Popen(
-                compression_cmd_list,
-                stdin=self.proc["partclone_backup_" + partition_key].stdout,
-                stdout=subprocess.PIPE,
-                env=env,
-                encoding="utf-8",
-            )
-
-            self.proc["split_" + partition_key] = subprocess.Popen(
-                split_cmd_list,
-                stdin=self.proc["compression_" + partition_key].stdout,
-                stdout=subprocess.PIPE,
-                env=env,
-                encoding="utf-8",
-            )
-
-            partclone_stderr = ""
-            # Process partclone output. Partclone outputs an update every 3 seconds, so processing the data
-            # on the current thread, for simplicity.
-            # Poll process.stdout to show stdout live
-            while True:
-                if self.requested_stop:
-                    self.ui_manager.completed_operation(
-                        callable_fn=self.completed_backup,
-                        succeeded=False,
-                        message=_("User requested operation to stop."),
-                    )
-                    return False, _("User requested operation to stop.")
-
-                output = self.proc[
-                    "partclone_backup_" + partition_key
-                ].stderr.readline()
-                if self.proc["partclone_backup_" + partition_key].poll() is not None:
-                    break
-                if output:
-                    partclone_stderr += output
-                    temp_dict = Partclone.parse_partclone_output(output)
-                    if "completed" in temp_dict.keys():
-                        total_progress_float = Utility.calculate_progress_ratio(
-                            current_partition_completed_percentage=temp_dict[
-                                "completed"
-                            ]
-                            / 100.0,
-                            current_partition_bytes=self.partitions_to_backup[
-                                partition_key
-                            ]["size"],
-                            cumulative_bytes=self.partitions_to_backup[partition_key][
-                                "cumulative_bytes"
-                            ],
-                            total_bytes=total_size,
-                            image_number=partition_number,
-                            num_partitions=len(self.partitions_to_backup),
-                        )
-                        self.ui_manager.update_progress_bar(
-                            fraction=total_progress_float
-                        )
-                    if "remaining" in temp_dict.keys():
-                        self.ui_manager.update_progress_status(
-                            message=filesystem_backup_message + "\n\n" + output
-                        )
-            _rc = self.proc["partclone_backup_" + partition_key].poll()
-
-            self.proc[
-                "partclone_backup_" + partition_key
-            ].stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
-            self.proc[
-                "compression_" + partition_key
-            ].stdout.close()  # Allow p2 to receive a SIGPIPE if p3 exits.
+            comp_stderr_file = tempfile.TemporaryFile(mode="w+b")
+            split_stderr_file = tempfile.TemporaryFile(mode="w+b")
+            p_partclone = None
+            p_comp = None
+            p_split = None
             try:
-                output, err = self.proc[
-                    "partclone_backup_" + partition_key
-                ].communicate()
-                self.logger.write("Exit output " + str(output) + "stderr " + str(err))
-            except ValueError as e:
-                # Workaround for Python3.7 process communicate() in while loop bug [1]
-                # [1] https://bugs.python.org/issue35182
-                self.logger.write("Exception during communicate:" + str(e))
+                try:
+                    p_partclone = subprocess.Popen(
+                        partclone_cmd_list,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        env=env,
+                        encoding="utf-8",
+                    )
+                    p_comp = subprocess.Popen(
+                        compression_cmd_list,
+                        stdin=p_partclone.stdout,
+                        stdout=subprocess.PIPE,
+                        stderr=comp_stderr_file,
+                        env=env,
+                        encoding="utf-8",
+                    )
+                    p_split = subprocess.Popen(
+                        split_cmd_list,
+                        stdin=p_comp.stdout,
+                        stdout=subprocess.PIPE,
+                        stderr=split_stderr_file,
+                        env=env,
+                        encoding="utf-8",
+                    )
+                except Exception:
+                    for spawned in (p_split, p_comp, p_partclone):
+                        if spawned is not None:
+                            try:
+                                if spawned.poll() is None:
+                                    spawned.terminate()
+                                    spawned.wait(timeout=3.0)
+                            except Exception:
+                                try:
+                                    spawned.kill()
+                                    spawned.wait(timeout=2.0)
+                                except Exception:
+                                    pass
+                            for pipe in (spawned.stdout, spawned.stderr):
+                                if pipe is not None:
+                                    try:
+                                        pipe.close()
+                                    except Exception:
+                                        pass
+                    raise
+                with self._proc_lock:
+                    self.proc["partclone_backup_" + partition_key] = p_partclone
+                    self.proc["compression_" + partition_key] = p_comp
+                    self.proc["split_" + partition_key] = p_split
 
-            # Ensure compression (including atomic .rzidx flush) and split finish cleanly
-            comp_rc = self.proc["compression_" + partition_key].wait()
-            split_rc = self.proc["split_" + partition_key].wait()
-            if (
-                self.proc["partclone_backup_" + partition_key].returncode != 0
-                or comp_rc != 0
-                or split_rc != 0
-            ):
+                partclone_stderr = ""
+                # Process partclone output. Partclone outputs an update every 3 seconds, so processing the data
+                # on the current thread, for simplicity.
+                # Poll process.stdout to show stdout live
+                while True:
+                    if self.requested_stop:
+                        self._terminate_and_wait_partition_procs(partition_key)
+                        self._remove_partition_output_files(filepath, seekidx_path)
+                        raise _BackupCancelledError()
+
+                    output = p_partclone.stderr.readline()
+                    if p_partclone.poll() is not None:
+                        break
+                    if output:
+                        partclone_stderr += output
+                        temp_dict = Partclone.parse_partclone_output(output)
+                        if "completed" in temp_dict.keys():
+                            total_progress_float = Utility.calculate_progress_ratio(
+                                current_partition_completed_percentage=temp_dict[
+                                    "completed"
+                                ]
+                                / 100.0,
+                                current_partition_bytes=self.partitions_to_backup[
+                                    partition_key
+                                ]["size"],
+                                cumulative_bytes=self.partitions_to_backup[
+                                    partition_key
+                                ]["cumulative_bytes"],
+                                total_bytes=total_size,
+                                image_number=partition_number,
+                                num_partitions=len(self.partitions_to_backup),
+                            )
+                            self.ui_manager.update_progress_bar(
+                                fraction=total_progress_float
+                            )
+                        if "remaining" in temp_dict.keys():
+                            self.ui_manager.update_progress_status(
+                                message=filesystem_backup_message + "\n\n" + output
+                            )
+
+                if self.requested_stop:
+                    self._terminate_and_wait_partition_procs(partition_key)
+                    self._remove_partition_output_files(filepath, seekidx_path)
+                    raise _BackupCancelledError()
+
+                _rc = p_partclone.poll()
+                p_partclone.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
+                p_comp.stdout.close()  # Allow p2 to receive a SIGPIPE if p3 exits.
+                try:
+                    output, err = p_partclone.communicate()
+                    self._log("Exit output " + str(output) + "stderr " + str(err))
+                except ValueError as e:
+                    # Workaround for Python3.7 process communicate() in while loop bug [1]
+                    # [1] https://bugs.python.org/issue35182
+                    self._log("Exception during communicate:" + str(e))
+
+                # Ensure compression (including atomic .rzidx flush) and split finish cleanly
+                comp_rc = p_comp.wait()
+                split_rc = p_split.wait()
+                if p_split.stdout is not None:
+                    try:
+                        p_split.stdout.close()
+                    except Exception:
+                        pass
+
+                if self.requested_stop:
+                    self._remove_partition_output_files(filepath, seekidx_path)
+                    raise _BackupCancelledError()
+
+                comp_stderr_file.seek(0)
+                compression_stderr = (
+                    comp_stderr_file.read(65536)
+                    .decode("utf-8", errors="replace")
+                    .strip()
+                )
+                split_stderr_file.seek(0)
+                split_stderr = (
+                    split_stderr_file.read(65536)
+                    .decode("utf-8", errors="replace")
+                    .strip()
+                )
+            finally:
+                try:
+                    comp_stderr_file.close()
+                except Exception:
+                    pass
+                try:
+                    split_stderr_file.close()
+                except Exception:
+                    pass
+
+            if p_partclone.returncode != 0 or comp_rc != 0 or split_rc != 0:
+                self.failed_partition_count += 1
                 partition_summary = (
                     _("<b>Failed to backup partition</b> {partition_name}").format(
                         partition_name=partition_key
@@ -1971,8 +2357,6 @@ class BackupManager:
                 with self.summary_message_lock:
                     self.summary_message += partition_summary
                 self.at_least_one_non_fatal_error = True
-                _proc_stdout = self.proc["partclone_backup_" + partition_key].stdout
-                _proc_stderr = self.proc["partclone_backup_" + partition_key].stderr
                 extra_info = (
                     "\nThe command used internally was:\n\n"
                     + flat_command_string
@@ -1980,32 +2364,34 @@ class BackupManager:
                     + "The output of the command was: "
                     + partclone_stderr
                 )
-                compression_stderr = self.proc["compression_" + partition_key].stderr
-                if compression_stderr is not None and compression_stderr != "":
+                if compression_stderr:
                     extra_info += (
                         "\n\n"
                         + str(compression_cmd_list)
                         + " stderr: "
                         + compression_stderr
                     )
+                    self._log(
+                        "Compression stderr ("
+                        + partition_key
+                        + "): "
+                        + compression_stderr
+                    )
+                if split_stderr:
+                    extra_info += (
+                        "\n\n" + str(split_cmd_list) + " stderr: " + split_stderr
+                    )
+                    self._log("Split stderr (" + partition_key + "): " + split_stderr)
 
                 # TODO: Try to backup again, but using partclone.dd
                 self.ui_manager.display_error_message(
                     summary_message=partition_summary + extra_info
                 )
                 # Delete failed partclone files (and any seek index file)
-                failed_partclone_img_path_list = glob.glob(filepath + "*")
-                if seekidx_path is not None:
-                    failed_partclone_img_path_list.extend(glob.glob(seekidx_path + "*"))
-                for file_path in failed_partclone_img_path_list:
-                    try:
-                        os.remove(file_path)
-                    except OSError:
-                        self.logger.write("Unable to remove: " + file_path)
-                        with self.summary_message_lock:
-                            self.summary_message += "Unable to remove: " + file_path
+                self._remove_partition_output_files(filepath, seekidx_path)
 
             else:
+                self.succeeded_partition_count += 1
                 with self.summary_message_lock:
                     self.summary_message += (
                         _("Successful backup of partition {partition_name}").format(
@@ -2116,22 +2502,25 @@ class BackupManager:
             return False, message, is_windows_reserved
         return True, "", is_windows_reserved
 
-    def _finalize_clonezilla_img_and_id(self, dest_dir=None):
-        """Close the active Logger and generate Clonezilla's Info-img-id.txt checksum tag."""
+    def _finalize_clonezilla_img_and_id(self, dest_dir=None, write_img_id=True):
+        """Close the active Logger and optionally generate Clonezilla's Info-img-id.txt checksum tag."""
         target_dir = dest_dir if dest_dir is not None else self.dest_dir
         clonezilla_img_filepath = os.path.join(target_dir, "clonezilla-img")
         info_img_id_filepath = os.path.join(target_dir, "Info-img-id.txt")
         if self.logger is not None:
-            self.logger.write(
-                "Closing the logfile "
-                + clonezilla_img_filepath
-                + " and generating a tag file for this image: "
-                + info_img_id_filepath
-            )
+            if write_img_id:
+                self.logger.write(
+                    "Closing the logfile "
+                    + clonezilla_img_filepath
+                    + " and generating a tag file for this image: "
+                    + info_img_id_filepath
+                )
+            else:
+                self.logger.write("Closing the logfile " + clonezilla_img_filepath)
             self.logger.close()
             self.logger = None
 
-        if os.path.isfile(clonezilla_img_filepath):
+        if write_img_id and os.path.isfile(clonezilla_img_filepath):
             process, flat_command_string, failed_message = Utility.run(
                 "Checksumming clonezilla-img file",
                 ["sha512sum", clonezilla_img_filepath],
@@ -2160,90 +2549,100 @@ class BackupManager:
                     )
 
     def completed_backup(self, succeeded, message):
-        self.ui_manager.update_progress_status(message="")
-        self.ui_manager.remove_all_main_statusbar(context_id="backup")
-        if not self.is_cloning:
-            backup_timeend = datetime.now()
-            duration_minutes = Utility.get_human_readable_minutes_seconds(
-                (backup_timeend - self.backup_timestart).total_seconds()
-            )
-            duration_message = _("Operation took {num_minutes} minutes.").format(
-                num_minutes=duration_minutes
-            )
-            self.ui_manager.remove_all_main_statusbar(context_id="backup")
-
-            with self.summary_message_lock:
-                if succeeded:
-                    if not self.at_least_one_non_fatal_error:
-                        self.summary_message = (
-                            _("Backup saved successfully.")
-                            + "\n\n"
-                            + self.summary_message
-                            + "\n\n"
-                            + message
-                            + "\n"
-                        )
-                    else:
-                        self.summary_message = (
-                            _("Backup succeeded with some errors:")
-                            + "\n\n"
-                            + self.summary_message
-                            + "\n\n"
-                            + message
-                            + "\n"
-                        )
-                else:
-                    heading = _("Backup operation failed:")
-                    self.summary_message = (
-                        heading
-                        + "\n\n"
-                        + self.summary_message
-                        + "\n\n"
-                        + message
-                        + "\n"
-                    )
-                    self.ui_manager.display_error_message(
-                        summary_message=self.summary_message, heading=heading
-                    )
-
-                self.summary_message += duration_message + "\n"
-                post_task_action: str = self.ui_manager.get_post_task_action()
-                if post_task_action != "DO_NOTHING":
-                    if succeeded:
-                        has_scheduled, msg = Utility.schedule_shutdown_reboot(
-                            post_task_action
-                        )
-                        self.summary_message += "\n" + msg
-                    else:
-                        self.summary_message += "\n" + _(
-                            "Shutdown/Reboot cancelled due to errors."
-                        )
-
-            # TODO: Populate summary page after umounting /mnt/backup (and closing the logger), so than umount errors
-            # TODO: are displayed.
-            self.populate_summary_page()
-
-            # Clonezilla writes a file named "Info-img-id.txt" which contains a sha512sum of the clonezilla-img log file.
-            self._finalize_clonezilla_img_and_id()
-        elif self.logger:
-            self.logger.close()
-            self.logger = None
-
-        if not self.is_cloning:
-            is_unmounted, umount_message = Utility.umount_warn_on_busy(
-                "/mnt/backup", is_lazy_umount=True
-            )
-            if not is_unmounted:
-                if self.logger is not None:
-                    self.logger.write(umount_message)
-                else:
-                    print(umount_message)
-                with self.summary_message_lock:
-                    self.summary_message += umount_message + "\n"
         with self.backup_in_progress_lock:
-            self.backup_in_progress = False
-        if not self.is_cloning:
-            self.completed_backup_callback(succeeded)
+            if self._single_backup_completed:
+                return
+            self._single_backup_completed = True
+        callback_succeeded = succeeded
+        try:
+            self.ui_manager.update_progress_status(message="")
+            self.ui_manager.remove_all_main_statusbar(context_id="backup")
+            if not self.is_cloning:
+                backup_timeend = datetime.now()
+                duration_minutes = Utility.get_human_readable_minutes_seconds(
+                    (backup_timeend - self.backup_timestart).total_seconds()
+                )
+                duration_message = _("Operation took {num_minutes} minutes.").format(
+                    num_minutes=duration_minutes
+                )
+                self.ui_manager.remove_all_main_statusbar(context_id="backup")
+
+                with self.summary_message_lock:
+                    if succeeded:
+                        if not self.at_least_one_non_fatal_error:
+                            self.summary_message = (
+                                _("Backup saved successfully.")
+                                + "\n\n"
+                                + self.summary_message
+                                + "\n\n"
+                                + message
+                                + "\n"
+                            )
+                        else:
+                            self.summary_message = (
+                                _("Backup succeeded with some errors:")
+                                + "\n\n"
+                                + self.summary_message
+                                + "\n\n"
+                                + message
+                                + "\n"
+                            )
+                    else:
+                        heading = _("Backup operation failed:")
+                        self.summary_message = (
+                            heading
+                            + "\n\n"
+                            + self.summary_message
+                            + "\n\n"
+                            + message
+                            + "\n"
+                        )
+                        self.ui_manager.display_error_message(
+                            summary_message=self.summary_message, heading=heading
+                        )
+
+                    self.summary_message += duration_message + "\n"
+                    post_task_action: str = self.ui_manager.get_post_task_action()
+                    if post_task_action != "DO_NOTHING":
+                        if succeeded:
+                            has_scheduled, msg = Utility.schedule_shutdown_reboot(
+                                post_task_action
+                            )
+                            self.summary_message += "\n" + msg
+                        else:
+                            self.summary_message += "\n" + _(
+                                "Shutdown/Reboot cancelled due to errors."
+                            )
+
+                # TODO: Populate summary page after umounting /mnt/backup (and closing the logger), so than umount errors
+                # TODO: are displayed.
+                self.populate_summary_page()
+
+                # Clonezilla writes a file named "Info-img-id.txt" which contains a sha512sum of the clonezilla-img log file.
+                self._finalize_clonezilla_img_and_id(write_img_id=bool(succeeded))
+            elif self.logger:
+                self.logger.close()
+                self.logger = None
+
+            if not self.is_cloning:
+                is_unmounted, umount_message = Utility.umount_warn_on_busy(
+                    "/mnt/backup", is_lazy_umount=True
+                )
+                if not is_unmounted:
+                    if self.logger is not None:
+                        self.logger.write(umount_message)
+                    else:
+                        print(umount_message)
+                    with self.summary_message_lock:
+                        self.summary_message += umount_message + "\n"
+        except Exception:
+            callback_succeeded = False
+            raise
+        finally:
+            with self.backup_in_progress_lock:
+                self.backup_in_progress = False
+            if not self.is_cloning:
+                self.completed_backup_callback(callback_succeeded)
 
     def populate_summary_page(self):
         with self.summary_message_lock:

@@ -28,7 +28,11 @@ from seekable_compressor import (
     CODEC_GZIP,
     CODEC_ZSTD,
     DEFAULT_FRAME_SIZE,
+    _LIBZSTD,
+    _compress_zstd_frame_libzstd,
+    _write_all,
     compress_stream,
+    get_zstd_backend_name,
     parse_seekidx_bytes,
 )
 from utility import Utility
@@ -254,6 +258,76 @@ class SeekableCompressorTest(unittest.TestCase):
                     check=True,
                 )
                 self.assertEqual(dec.stdout, payload)
+
+    def test_libzstd_ctypes_backend_nonempty_and_empty_and_write_all_none(self):
+        # F1 / M2 / M5: Directly verify native libzstd.so.1 ctypes path (used on Ubuntu 24.04 Python 3.12 ISO),
+        # including multi-threaded compress_stream and per-frame RFC 8878 content checksum flag (bit 2 = 0x04).
+        from unittest.mock import patch
+        import seekable_compressor as sc
+
+        self.assertIn(
+            get_zstd_backend_name(), ("stdlib", "zstandard", "libzstd", "subprocess")
+        )
+        if _LIBZSTD is not None and shutil.which("zstd"):
+            payload = (b"libzstd native frame test 0123456789 " * 30000)[: 1024 * 1024]
+            for sample in (payload, b""):
+                frame = _compress_zstd_frame_libzstd(sample, 3)
+                self.assertGreater(len(frame), 5)
+                # RFC 8878 Frame_Header_Descriptor bit 2 == Content_Checksum_flag
+                self.assertTrue(bool(frame[4] & 0x04))
+                dec = subprocess.run(
+                    ["zstd", "-d", "-c"],
+                    input=frame,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=True,
+                )
+                self.assertEqual(dec.stdout, sample)
+
+            # M5: Force multi-threaded compress_stream through the exact libzstd path
+            big_payload = b"multithreaded libzstd payload block! " * 40000 + os.urandom(
+                512 * 1024
+            )
+            with (
+                patch.object(sc, "_py_zstd", None),
+                patch.object(sc, "_zstandard_pkg", None),
+            ):
+                self.assertEqual(sc.get_zstd_backend_name(), "libzstd")
+                out_buf = io.BytesIO()
+                fc, tc, tu = compress_stream(
+                    io.BytesIO(big_payload),
+                    out_buf,
+                    fmt="zstd",
+                    level=3,
+                    frame_size=256 * 1024,
+                    threads=4,
+                )
+                self.assertGreaterEqual(fc, 6)
+                self.assertEqual(tu, len(big_payload))
+                blob = out_buf.getvalue()
+                self.assertEqual(tc, len(blob))
+                self.assertTrue(bool(blob[4] & 0x04))
+                dec = subprocess.run(
+                    ["zstd", "-d", "-c"],
+                    input=blob,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=True,
+                )
+                self.assertEqual(dec.stdout, big_payload)
+
+        # M2: Also verify active compress_zstd_frame (stdlib on 3.14) sets checksum flag
+        if shutil.which("zstd"):
+            std_frame = sc.compress_zstd_frame(b"checksum check " * 50, 3)
+            self.assertTrue(bool(std_frame[4] & 0x04))
+
+        # F13: _write_all must raise BlockingIOError if write() returns None
+        class _NoneStream:
+            def write(self, _data):
+                return None
+
+        with self.assertRaises(BlockingIOError):
+            _write_all(_NoneStream(), b"abc")
 
 
 if __name__ == "__main__":

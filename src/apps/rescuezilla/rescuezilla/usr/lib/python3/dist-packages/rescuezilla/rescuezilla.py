@@ -27,7 +27,10 @@ import os
 import sys
 import argparse
 
-from backup_manager import BackupManager, compute_backup_dest_dirs
+from backup_manager import (
+    BackupManager,
+    prepare_cli_backup_jobs,
+)
 from cli.args import parse_arguments
 from parser.clonezilla_image import ClonezillaImage
 from parser.metadata_only_image import MetadataOnlyImage
@@ -114,9 +117,18 @@ def cli_mode(args: argparse.Namespace, human_readable_version: str):
             "format": args.compression_format,
             "level": args.compression_level,
         }
-        if isinstance(args.source, list) and len(args.source) > 1:
-            dest_dirs = compute_backup_dest_dirs(args.destination, args.source)
-            backup_jobs = [(dk, args.partitions, dest_dirs[dk]) for dk in args.source]
+        try:
+            backup_jobs = prepare_cli_backup_jobs(
+                drive_state=drive_state,
+                raw_sources=args.source,
+                raw_partitions=args.partitions,
+                destination=args.destination,
+            )
+        except ValueError as exc:
+            sys.stderr.write(f"Error: {exc}\n")
+            sys.exit(2)
+
+        if len(backup_jobs) > 1:
             backup_manager.start_multi_drive_backup(
                 backup_jobs=backup_jobs,
                 drive_state=drive_state,
@@ -127,12 +139,12 @@ def cli_mode(args: argparse.Namespace, human_readable_version: str):
                 on_separate_thread=False,
             )
         else:
-            src_drive = args.source[0] if isinstance(args.source, list) else args.source
+            src_drive, parts_for_drive, dst_dir = backup_jobs[0]
             backup_manager.start_backup(
                 selected_drive_key=src_drive,
-                partitions_to_backup=args.partitions,
+                partitions_to_backup=parts_for_drive,
                 drive_state=drive_state,
-                dest_dir=args.destination,
+                dest_dir=dst_dir,
                 backup_notes=args.description,
                 compression_dict=compression_dict,
                 is_rescue=args.rescue,

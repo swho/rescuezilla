@@ -29,13 +29,23 @@ def add_option_argument_with_mutually_exclusive_positional_arg(
     parser: argparse.ArgumentParser, name: str, help: str, allow_multiple: bool = False
 ):
     pos_group = parser.add_mutually_exclusive_group(required=True)
-    pos_group.add_argument(
-        f"--{name}",
-        nargs="+" if allow_multiple else "?",
-        default=None,
-        type=str,
-        help=help,
-    )
+    if allow_multiple:
+        pos_group.add_argument(
+            f"--{name}",
+            action="extend",
+            nargs="+",
+            default=None,
+            type=str,
+            help=help,
+        )
+    else:
+        pos_group.add_argument(
+            f"--{name}",
+            nargs="?",
+            default=None,
+            type=str,
+            help=help,
+        )
     pos_group.add_argument(f"{name}_positional_arg", nargs="?", default=None, type=str)
 
 
@@ -89,7 +99,7 @@ def parse_arguments(parser: argparse.ArgumentParser) -> argparse.Namespace:
     add_option_argument_with_mutually_exclusive_positional_arg(
         backup_parser,
         "source",
-        "Device(s) to backup (pass multiple devices for multi-disk backup)",
+        "Device(s) to backup (pass multiple devices with --destination for multi-disk backup)",
         allow_multiple=True,
     )
     add_option_argument_with_mutually_exclusive_positional_arg(

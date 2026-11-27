@@ -38,11 +38,13 @@ Backward compatibility guarantee:
 import argparse
 import collections
 from concurrent.futures import ThreadPoolExecutor
+import ctypes
 import os
 import signal
 import struct
 import subprocess
 import sys
+import threading
 import zlib
 from typing import List, Optional, Tuple
 
@@ -50,6 +52,148 @@ try:
     from compression import zstd as _py_zstd  # Python 3.14+ stdlib
 except ImportError:
     _py_zstd = None
+
+try:
+    import zstandard as _zstandard_pkg  # python3-zstandard if installed
+except ImportError:
+    _zstandard_pkg = None
+
+
+_ZSTD_C_COMPRESSION_LEVEL = 100  # ZSTD_c_compressionLevel from zstd.h
+_ZSTD_C_CHECKSUM_FLAG = (
+    201  # ZSTD_c_checksumFlag from zstd.h (XXH64 per-frame checksum)
+)
+
+
+def _load_libzstd():
+    """Load system libzstd.so.1 via ctypes (present on Ubuntu 24.04 Noble ISO)."""
+    for libname in ("libzstd.so.1", "libzstd.so"):
+        try:
+            lib = ctypes.CDLL(libname)
+            lib.ZSTD_compressBound.argtypes = [ctypes.c_size_t]
+            lib.ZSTD_compressBound.restype = ctypes.c_size_t
+            lib.ZSTD_createCCtx.argtypes = []
+            lib.ZSTD_createCCtx.restype = ctypes.c_void_p
+            lib.ZSTD_freeCCtx.argtypes = [ctypes.c_void_p]
+            lib.ZSTD_freeCCtx.restype = ctypes.c_size_t
+            lib.ZSTD_CCtx_setParameter.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+            lib.ZSTD_CCtx_setParameter.restype = ctypes.c_size_t
+            lib.ZSTD_compress2.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+            ]
+            lib.ZSTD_compress2.restype = ctypes.c_size_t
+            lib.ZSTD_isError.argtypes = [ctypes.c_size_t]
+            lib.ZSTD_isError.restype = ctypes.c_uint
+            lib.ZSTD_getErrorName.argtypes = [ctypes.c_size_t]
+            lib.ZSTD_getErrorName.restype = ctypes.c_char_p
+            return lib
+        except (OSError, AttributeError):
+            continue
+    return None
+
+
+_LIBZSTD = _load_libzstd()
+_ZSTD_THREAD_LOCAL = threading.local()
+_ZSTD_SUBPROC_WARNED = False
+
+
+class _LibZstdThreadCtx:
+    """Thread-local ZSTD_CCtx + reusable output buffer (GIL released during C call).
+
+    Enables ZSTD_c_checksumFlag=1 (32-bit XXH64 content checksum per frame) to
+    match stock `zstd` CLI integrity guarantees.
+    """
+
+    def __init__(self, lib):
+        self._lib = lib
+        self._cctx = lib.ZSTD_createCCtx()
+        if not self._cctx:
+            raise MemoryError("ZSTD_createCCtx() returned NULL")
+        self._buf = None
+        self._buf_cap = 0
+        self._configured_level = None
+        rc = int(lib.ZSTD_CCtx_setParameter(self._cctx, _ZSTD_C_CHECKSUM_FLAG, 1))
+        if lib.ZSTD_isError(rc):
+            lib.ZSTD_freeCCtx(self._cctx)
+            self._cctx = None
+            raise RuntimeError("libzstd failed to enable ZSTD_c_checksumFlag")
+
+    def compress(self, data: bytes, level: int) -> bytes:
+        level_int = int(level)
+        if self._configured_level != level_int:
+            rc_lvl = int(
+                self._lib.ZSTD_CCtx_setParameter(
+                    self._cctx, _ZSTD_C_COMPRESSION_LEVEL, level_int
+                )
+            )
+            if self._lib.ZSTD_isError(rc_lvl):
+                err_name = self._lib.ZSTD_getErrorName(rc_lvl)
+                msg = (
+                    err_name.decode("utf-8", errors="replace")
+                    if err_name
+                    else f"code={rc_lvl}"
+                )
+                raise RuntimeError(f"libzstd failed to set compression level: {msg}")
+            self._configured_level = level_int
+
+        src_len = len(data)
+        bound = int(self._lib.ZSTD_compressBound(src_len))
+        if self._buf is None or self._buf_cap < bound:
+            self._buf = ctypes.create_string_buffer(bound)
+            self._buf_cap = bound
+        # Pass empty buffer safely when src_len == 0
+        src_arg = data if src_len > 0 else b"\x00"
+        rc = int(
+            self._lib.ZSTD_compress2(self._cctx, self._buf, bound, src_arg, src_len)
+        )
+        if self._lib.ZSTD_isError(rc):
+            err_name = self._lib.ZSTD_getErrorName(rc)
+            msg = (
+                err_name.decode("utf-8", errors="replace") if err_name else f"code={rc}"
+            )
+            raise RuntimeError(f"libzstd ZSTD_compress2 failed: {msg}")
+        return ctypes.string_at(self._buf, rc)
+
+    def __del__(self):
+        cctx = getattr(self, "_cctx", None)
+        lib = getattr(self, "_lib", None)
+        if cctx and lib is not None:
+            try:
+                lib.ZSTD_freeCCtx(cctx)
+            except Exception:
+                pass
+            self._cctx = None
+
+
+def get_zstd_backend_name() -> str:
+    """Return active zstd compression backend identifier."""
+    if _py_zstd is not None:
+        return "stdlib"
+    if _zstandard_pkg is not None:
+        return "zstandard"
+    if _LIBZSTD is not None:
+        return "libzstd"
+    return "subprocess"
+
+
+def _compress_zstd_frame_libzstd(data: bytes, level: int) -> bytes:
+    """Compress one independent RFC 8878 zstd frame via native libzstd.so.1."""
+    if _LIBZSTD is None:
+        raise RuntimeError("libzstd.so.1 is not available")
+    ctx = getattr(_ZSTD_THREAD_LOCAL, "libzstd_ctx", None)
+    if ctx is None:
+        ctx = _LibZstdThreadCtx(_LIBZSTD)
+        _ZSTD_THREAD_LOCAL.libzstd_ctx = ctx
+    return ctx.compress(data, level)
+
 
 SEEKIDX_MAGIC = b"RZSKIDX1"
 SEEKIDX_VERSION = 1
@@ -72,9 +216,40 @@ def compress_gzip_frame(data: bytes, level: int) -> bytes:
 
 
 def compress_zstd_frame(data: bytes, level: int) -> bytes:
-    """Compress a single independent RFC 8878 zstd frame."""
+    """Compress a single independent RFC 8878 zstd frame with content checksum enabled.
+
+    Backend priority (zero subprocess spawn on Ubuntu 24.04 Noble & Python 3.14+):
+    1. Python 3.14+ stdlib compression.zstd
+    2. python3-zstandard (if installed)
+    3. Native libzstd.so.1 via ctypes (thread-local ZSTD_CCtx, GIL-free)
+    4. zstd CLI subprocess (last-resort fallback)
+    """
+    global _ZSTD_SUBPROC_WARNED
     if _py_zstd is not None:
-        return _py_zstd.compress(data, level=level)
+        return _py_zstd.compress(
+            data,
+            options={
+                _py_zstd.CompressionParameter.compression_level: int(level),
+                _py_zstd.CompressionParameter.checksum_flag: 1,
+            },
+        )
+    if _zstandard_pkg is not None:
+        cache = getattr(_ZSTD_THREAD_LOCAL, "zstandard_cctx", None)
+        if cache is None or cache[0] != level:
+            cache = (
+                level,
+                _zstandard_pkg.ZstdCompressor(level=level, write_checksum=True),
+            )
+            _ZSTD_THREAD_LOCAL.zstandard_cctx = cache
+        return cache[1].compress(data)
+    if _LIBZSTD is not None:
+        return _compress_zstd_frame_libzstd(data, level)
+
+    if not _ZSTD_SUBPROC_WARNED:
+        _ZSTD_SUBPROC_WARNED = True
+        sys.stderr.write(
+            "seekable_compressor warning: no native zstd library found; falling back to per-frame zstd subprocess\n"
+        )
     proc = subprocess.run(
         ["zstd", "--stdout", f"-{level}", "--threads=1", "--quiet"],
         input=data,
@@ -186,7 +361,7 @@ def _write_all(stream, data: bytes) -> None:
     while written < total:
         n = stream.write(mv[written:])
         if n is None:
-            return
+            raise BlockingIOError("Non-blocking stdout stream returned None on write")
         if n == 0:
             raise BrokenPipeError("Short write to stdout")
         written += n

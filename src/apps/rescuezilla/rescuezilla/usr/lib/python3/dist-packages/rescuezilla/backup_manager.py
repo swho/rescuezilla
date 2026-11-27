@@ -2273,14 +2273,20 @@ class BackupManager:
                         env=env,
                         encoding="utf-8",
                     )
+                    # Close parent's copy of p_partclone.stdout immediately so p_partclone
+                    # receives SIGPIPE instead of deadlocking if p_comp exits early!
+                    p_partclone.stdout.close()
                     p_split = subprocess.Popen(
                         split_cmd_list,
                         stdin=p_comp.stdout,
-                        stdout=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL,
                         stderr=split_stderr_file,
                         env=env,
                         encoding="utf-8",
                     )
+                    # Close parent's copy of p_comp.stdout immediately so p_comp receives
+                    # SIGPIPE instead of deadlocking if p_split exits early (e.g. disk full)!
+                    p_comp.stdout.close()
                 except Exception:
                     for spawned in (p_split, p_comp, p_partclone):
                         if spawned is not None:
@@ -2317,7 +2323,7 @@ class BackupManager:
                         raise _BackupCancelledError()
 
                     output = p_partclone.stderr.readline()
-                    if p_partclone.poll() is not None:
+                    if not output and p_partclone.poll() is not None:
                         break
                     if output:
                         partclone_stderr += output
@@ -2351,25 +2357,17 @@ class BackupManager:
                     self._remove_partition_output_files(filepath, seekidx_path)
                     raise _BackupCancelledError()
 
-                _rc = p_partclone.poll()
-                p_partclone.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
-                p_comp.stdout.close()  # Allow p2 to receive a SIGPIPE if p3 exits.
-                try:
-                    output, err = p_partclone.communicate()
-                    self._log("Exit output " + str(output) + "stderr " + str(err))
-                except ValueError as e:
-                    # Workaround for Python3.7 process communicate() in while loop bug [1]
-                    # [1] https://bugs.python.org/issue35182
-                    self._log("Exception during communicate:" + str(e))
+                if p_partclone.stderr is not None:
+                    try:
+                        p_partclone.stderr.close()
+                    except Exception:
+                        pass
+                _rc = p_partclone.wait()
+                self._log("Partclone exit code: " + str(_rc))
 
                 # Ensure compression (including atomic .rzidx flush) and split finish cleanly
                 comp_rc = p_comp.wait()
                 split_rc = p_split.wait()
-                if p_split.stdout is not None:
-                    try:
-                        p_split.stdout.close()
-                    except Exception:
-                        pass
 
                 if self.requested_stop:
                     self._remove_partition_output_files(filepath, seekidx_path)

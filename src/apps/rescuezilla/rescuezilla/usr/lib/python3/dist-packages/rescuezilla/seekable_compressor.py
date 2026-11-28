@@ -2,6 +2,9 @@
 # ----------------------------------------------------------------------
 #   Copyright (C) 2026 Rescuezilla Seekable-Index Community Fork Contributors
 #   Derived from Rescuezilla (Copyright (C) 2019-2025 Rescuezilla.com)
+#   Modified 2026-11-28 (Community Fork): RAM-aware multi-core worker count,
+#   native libdeflate gzip backend, format-specific default frame size, and
+#   --print-stats telemetry (GPL-3.0-or-later).
 # ----------------------------------------------------------------------
 #   This program is free software: you can redistribute it and/or modify
 #   it under the terms of the GNU General Public License as published by
@@ -19,7 +22,8 @@
 """Seekable multi-frame stream compressor for Rescuezilla backups.
 
 Reads an uncompressed Partclone stream from stdin in fixed-size chunks
-(default 1 MiB), compresses each chunk in parallel as an independent,
+(default 1 MiB for gzip, 4 MiB for zstd), compresses each chunk in parallel
+(all usable CPUs, RAM-capped) as an independent,
 RFC-compliant gzip (RFC 1952) or zstd (RFC 8878) frame, writes the
 concatenated frames strictly in order to stdout (piped to `split`), and
 atomically writes a compact binary seek index (`Info-seekidx-<part>.rzidx`).
@@ -39,12 +43,14 @@ import argparse
 import collections
 from concurrent.futures import ThreadPoolExecutor
 import ctypes
+import ctypes.util
 import os
 import signal
 import struct
 import subprocess
 import sys
 import threading
+import time
 import zlib
 from typing import List, Optional, Tuple
 
@@ -207,12 +213,226 @@ _CRC_STRUCT = struct.Struct("<I")  # 4 bytes
 DEFAULT_FRAME_SIZE = (
     1 * 1024 * 1024
 )  # 1 MiB (fine random-access granularity, <0.05% overhead)
+DEFAULT_ZSTD_FRAME_SIZE = 4 * 1024 * 1024  # 4 MiB (better zstd ratio/throughput)
 
 
-def compress_gzip_frame(data: bytes, level: int) -> bytes:
-    """Compress a single independent RFC 1952 gzip member (releases GIL in zlib C)."""
-    comp = zlib.compressobj(level, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+def default_frame_size_for_format(fmt: str) -> int:
+    """Return the default seekable frame size for a compression format."""
+    if str(fmt).strip().lower() == "zstd":
+        return DEFAULT_ZSTD_FRAME_SIZE
+    return DEFAULT_FRAME_SIZE
+
+
+# ----------------------------------------------------------------------
+# Worker sizing (CPU affinity + RAM aware)
+# ----------------------------------------------------------------------
+
+
+def _get_available_cpu_count() -> int:
+    """CPUs usable by this process (honours taskset / cgroup cpusets)."""
+    try:
+        n = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        n = os.cpu_count() or 1
+    return max(1, int(n))
+
+
+def _get_available_memory_bytes() -> Optional[int]:
+    """Return MemAvailable (fallback MemTotal) from /proc/meminfo in bytes, or None."""
+    try:
+        with open("/proc/meminfo", "r", encoding="ascii", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None
+    values = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] in ("MemAvailable:", "MemTotal:"):
+            try:
+                kib = int(parts[1])
+            except ValueError:
+                continue
+            if kib > 0:
+                values[parts[0]] = kib * 1024
+    if "MemAvailable:" in values:
+        return values["MemAvailable:"]
+    return values.get("MemTotal:")
+
+
+def _estimate_worker_cctx_bytes(fmt: str, level: int) -> int:
+    """Estimate per-worker compressor context RSS (based on Noble libzstd/libdeflate measurements)."""
+    fmt_norm = str(fmt).strip().lower()
+    lvl = int(level)
+    if fmt_norm == "zstd":
+        # Measured delta_maxrss on Ubuntu 24.04 Noble libzstd1 1.5.5 (4 MiB frame):
+        # lvl 1-6: 4-7 MiB, lvl 9: ~15 MiB, lvl 12: ~45 MiB, lvl 15-19: ~53-69 MiB.
+        if lvl <= 6:
+            return 16 * 1024 * 1024
+        if lvl <= 10:
+            return 32 * 1024 * 1024
+        if lvl <= 14:
+            return 64 * 1024 * 1024
+        return 96 * 1024 * 1024
+    return 4 * 1024 * 1024
+
+
+def default_worker_count(frame_size: int, fmt: str = "gzip", level: int = 6) -> int:
+    """Number of compression threads: all usable CPUs, capped by available RAM.
+
+    Accounts for both in-flight frame buffers (frame_size * 8) and per-worker
+    compressor context state (e.g. high-level zstd ZSTD_CCtx hash/chain tables).
+    """
+    workers = _get_available_cpu_count()
+    mem_avail = _get_available_memory_bytes()
+    if mem_avail is not None:
+        fs = max(1, int(frame_size))
+        cctx_bytes = _estimate_worker_cctx_bytes(fmt, level)
+        per_worker_budget = max(fs * 8, fs * 4 + cctx_bytes * 2)
+        workers = min(workers, max(1, mem_avail // per_worker_budget))
+    return max(1, int(workers))
+
+
+def default_max_in_flight(workers: int, frame_size: int) -> int:
+    """Bound on queued frames (raw + compressed ~= 2x frame_size each).
+
+    Enough queue depth to avoid head-of-line worker starvation on 16-32T CPUs,
+    while keeping in-flight buffers <= half of available RAM (minimum 2 frames).
+    """
+    workers = max(1, int(workers))
+    desired = min(workers * 2, workers + 16)
+    mem_avail = _get_available_memory_bytes()
+    if mem_avail is not None:
+        mem_cap = (mem_avail // 2) // max(1, int(frame_size) * 2)
+        return max(2, min(desired, mem_cap))
+    return max(2, desired)
+
+
+# ----------------------------------------------------------------------
+# gzip backends: native libdeflate.so.0 (GIL-free) -> Python zlib fallback
+# ----------------------------------------------------------------------
+
+
+def _load_libdeflate():
+    """Load system libdeflate.so.0 via ctypes (libdeflate0 on Ubuntu 24.04 Noble ISO)."""
+    candidates = ["libdeflate.so.0"]
+    found = ctypes.util.find_library("deflate")
+    if found and found not in candidates:
+        candidates.append(found)
+    for libname in candidates:
+        try:
+            lib = ctypes.CDLL(libname)
+            lib.libdeflate_alloc_compressor.argtypes = [ctypes.c_int]
+            lib.libdeflate_alloc_compressor.restype = ctypes.c_void_p
+            lib.libdeflate_free_compressor.argtypes = [ctypes.c_void_p]
+            lib.libdeflate_free_compressor.restype = None
+            lib.libdeflate_gzip_compress_bound.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+            ]
+            lib.libdeflate_gzip_compress_bound.restype = ctypes.c_size_t
+            lib.libdeflate_gzip_compress.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+            ]
+            lib.libdeflate_gzip_compress.restype = ctypes.c_size_t
+            return lib
+        except (OSError, AttributeError):
+            continue
+    return None
+
+
+_LIBDEFLATE = _load_libdeflate()
+_GZIP_THREAD_LOCAL = threading.local()
+
+
+class _LibDeflateCompressor:
+    """RAII wrapper around one `libdeflate_compressor*` (one per thread & level).
+
+    Holds a direct reference to libdeflate_free_compressor so __del__ works even
+    during interpreter shutdown after module globals have been cleared.
+    """
+
+    def __init__(self, lib, level: int):
+        self._free = lib.libdeflate_free_compressor
+        self._bound_fn = lib.libdeflate_gzip_compress_bound
+        self._compress_fn = lib.libdeflate_gzip_compress
+        self._handle = lib.libdeflate_alloc_compressor(int(level))
+        if not self._handle:
+            raise RuntimeError(
+                f"libdeflate_alloc_compressor({int(level)}) returned NULL"
+            )
+        self._buf = None
+        self._buf_cap = 0
+
+    def compress(self, data: bytes) -> bytes:
+        src_len = len(data)
+        bound = int(self._bound_fn(self._handle, src_len))
+        if bound <= 0:
+            raise RuntimeError("libdeflate_gzip_compress_bound returned 0")
+        if self._buf is None or self._buf_cap < bound:
+            self._buf = ctypes.create_string_buffer(bound)
+            self._buf_cap = bound
+        # Pass a valid non-NULL pointer when src_len == 0 (empty gzip member)
+        src_arg = data if src_len > 0 else b"\x00"
+        n = int(self._compress_fn(self._handle, src_arg, src_len, self._buf, bound))
+        if n <= 0 or n > bound:
+            raise RuntimeError(f"libdeflate_gzip_compress failed (returned {n})")
+        return ctypes.string_at(self._buf, n)
+
+    def __del__(self):
+        handle = getattr(self, "_handle", None)
+        free_fn = getattr(self, "_free", None)
+        if handle and free_fn is not None:
+            try:
+                free_fn(handle)
+            except Exception:
+                pass
+            self._handle = None
+
+
+def get_gzip_backend_name() -> str:
+    """Return active gzip compression backend identifier."""
+    return "libdeflate" if _LIBDEFLATE is not None else "zlib"
+
+
+def _compress_gzip_frame_libdeflate(data: bytes, level: int) -> bytes:
+    """Compress one independent RFC 1952 gzip member via native libdeflate.so.0."""
+    lib = _LIBDEFLATE
+    if lib is None:
+        raise RuntimeError("libdeflate.so.0 is not available")
+    lvl = max(0, min(12, int(level)))
+    cache = getattr(_GZIP_THREAD_LOCAL, "libdeflate", None)
+    if cache is None:
+        cache = {}
+        _GZIP_THREAD_LOCAL.libdeflate = cache
+    comp = cache.get(lvl)
+    if comp is None:
+        comp = _LibDeflateCompressor(lib, lvl)
+        cache[lvl] = comp
+    return comp.compress(data)
+
+
+def _compress_gzip_frame_zlib(data: bytes, level: int) -> bytes:
+    lvl = max(0, min(9, int(level)))
+    comp = zlib.compressobj(lvl, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
     return comp.compress(data) + comp.flush()
+
+
+def compress_gzip_frame(data: bytes, level: int = 6) -> bytes:
+    """Compress a single independent RFC 1952 gzip member.
+
+    Uses native libdeflate (GIL released during the C call) when available,
+    falling back cleanly to Python zlib if libdeflate is missing or fails.
+    """
+    if _LIBDEFLATE is not None:
+        try:
+            return _compress_gzip_frame_libdeflate(data, level)
+        except (RuntimeError, MemoryError):
+            pass
+    return _compress_gzip_frame_zlib(data, level)
 
 
 def compress_zstd_frame(data: bytes, level: int) -> bytes:
@@ -373,11 +593,16 @@ def compress_stream(
     *,
     fmt: str,
     level: int,
-    frame_size: int = DEFAULT_FRAME_SIZE,
+    frame_size: Optional[int] = None,
     index_output: Optional[str] = None,
     threads: Optional[int] = None,
+    stats: Optional[dict] = None,
 ) -> Tuple[int, int, int]:
     """Compress stdin -> stdout in independent frames and write atomic .rzidx index.
+
+    `frame_size=None` selects default_frame_size_for_format(fmt) and
+    `threads=None/0` selects default_worker_count(frame_size, fmt=..., level=...). If `stats` is a
+    dict it is filled with fmt/level/backend/workers/frame_size.
 
     Returns (frame_count, total_compressed_bytes, total_uncompressed_bytes).
     """
@@ -385,19 +610,36 @@ def compress_stream(
     if fmt_norm == "gzip":
         codec = CODEC_GZIP
         compress_fn = compress_gzip_frame
+        backend = get_gzip_backend_name()
     elif fmt_norm == "zstd":
         codec = CODEC_ZSTD
         compress_fn = compress_zstd_frame
+        backend = get_zstd_backend_name()
     else:
         raise ValueError(f"Unsupported seekable compression format: {fmt}")
 
+    if frame_size is None:
+        frame_size = default_frame_size_for_format(fmt_norm)
+    frame_size = int(frame_size)
     if frame_size < 65536:
         raise ValueError(f"frame_size too small: {frame_size}")
 
-    # Keep bounded memory even on low-RAM Live USB environments
-    cpu_cnt = os.cpu_count() or 1
-    workers = max(1, int(threads) if threads else min(cpu_cnt, 8))
-    max_in_flight = workers + 2
+    # Use all usable CPUs, but keep bounded memory on low-RAM Live USB environments
+    workers = (
+        max(1, int(threads))
+        if threads
+        else default_worker_count(frame_size, fmt=fmt_norm, level=level)
+    )
+    max_in_flight = default_max_in_flight(workers, frame_size)
+    if stats is not None:
+        stats.update(
+            fmt=fmt_norm,
+            level=int(level),
+            backend=backend,
+            workers=workers,
+            max_in_flight=max_in_flight,
+            frame_size=frame_size,
+        )
 
     tmp_index: Optional[str] = None
     if index_output:
@@ -470,16 +712,51 @@ def compress_stream(
                 pass
 
 
+STATS_LINE_PREFIX = "[seekable_compressor]"
+
+
+def format_stats_line(
+    stats: dict, frames: int, in_bytes: int, out_bytes: int, elapsed: float
+) -> str:
+    """Single-line telemetry summary (MBps = 10^6 bytes per second)."""
+    ratio = (100.0 * out_bytes / in_bytes) if in_bytes > 0 else 0.0
+    secs = max(float(elapsed), 1e-9)
+    return (
+        f"{STATS_LINE_PREFIX} fmt={stats.get('fmt')} level={stats.get('level')} "
+        f"backend={stats.get('backend')} workers={stats.get('workers')} "
+        f"frame_size={stats.get('frame_size')} frames={frames} "
+        f"in_bytes={in_bytes} out_bytes={out_bytes} ratio={ratio:.2f}% "
+        f"elapsed={float(elapsed):.3f}s in_MBps={in_bytes / 1e6 / secs:.2f} "
+        f"out_MBps={out_bytes / 1e6 / secs:.2f}"
+    )
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Seekable multi-frame gzip/zstd compressor with .rzidx generation for Rescuezilla"
     )
     parser.add_argument("--format", required=True, choices=["gzip", "zstd"])
     parser.add_argument("--level", type=int, default=6)
-    parser.add_argument("--frame-size", type=int, default=DEFAULT_FRAME_SIZE)
+    parser.add_argument(
+        "--frame-size",
+        type=int,
+        default=None,
+        help="Frame size in bytes (default: 4 MiB for zstd, 1 MiB for gzip)",
+    )
     parser.add_argument("--index-output", type=str, default=None)
     parser.add_argument("--threads", type=int, default=None)
+    parser.add_argument(
+        "--print-stats",
+        action="store_true",
+        default=False,
+        help="Write one [seekable_compressor] summary line to stderr on success",
+    )
     args = parser.parse_args(argv)
+    frame_size = (
+        args.frame_size
+        if args.frame_size is not None
+        else default_frame_size_for_format(args.format)
+    )
 
     def _on_signal(signum, _frame):
         raise SystemExit(128 + signum)
@@ -488,15 +765,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     signal.signal(signal.SIGINT, _on_signal)
 
     try:
-        compress_stream(
+        stats: dict = {}
+        t0 = time.monotonic()
+        frames, out_bytes, in_bytes = compress_stream(
             sys.stdin.buffer,
             sys.stdout.buffer,
             fmt=args.format,
             level=args.level,
-            frame_size=args.frame_size,
+            frame_size=frame_size,
             index_output=args.index_output,
             threads=args.threads,
+            stats=stats,
         )
+        if args.print_stats:
+            elapsed = time.monotonic() - t0
+            sys.stderr.write(
+                format_stats_line(stats, frames, in_bytes, out_bytes, elapsed) + "\n"
+            )
+            sys.stderr.flush()
         return 0
     except BrokenPipeError:
         return 141

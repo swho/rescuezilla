@@ -4,6 +4,8 @@
 #   Copyright (C) 2019-2025 Rescuezilla.com <rescuezilla@gmail.com>
 #   Modified 2026-11-25 (Community Fork): Added seekable multi-frame
 #   compression command helpers (GPL-3.0-or-later).
+#   Modified 2026-11-28 (Community Fork): Format-specific default seekable
+#   frame size and --print-stats option (GPL-3.0-or-later).
 # ----------------------------------------------------------------------
 #   This program is free software: you can redistribute it and/or modify
 #   it under the terms of the GNU General Public License as published by
@@ -957,15 +959,24 @@ class Utility:
         format,
         level_integer,
         index_output_path,
-        frame_size=1 * 1024 * 1024,
+        frame_size=None,
+        print_stats=False,
     ):
-        """Return command list that produces RFC-compliant seekable gzip/zstd + .rzidx."""
+        """Return command list that produces RFC-compliant seekable gzip/zstd + .rzidx.
+
+        frame_size=None selects 4 MiB for zstd and 1 MiB for gzip.
+        print_stats=True appends --print-stats (one telemetry line on stderr).
+        """
         if format in ("gzip", "zstd"):
+            if frame_size is None:
+                from seekable_compressor import default_frame_size_for_format
+
+                frame_size = default_frame_size_for_format(format)
             compressor_script = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),
                 "seekable_compressor.py",
             )
-            return [
+            cmd_list = [
                 sys.executable,
                 compressor_script,
                 "--format",
@@ -977,6 +988,9 @@ class Utility:
                 "--index-output",
                 index_output_path,
             ]
+            if print_stats:
+                cmd_list.append("--print-stats")
+            return cmd_list
         return Utility.get_compression_cmd_list(format, level_integer)
 
     @staticmethod

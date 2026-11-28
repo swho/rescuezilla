@@ -5,6 +5,8 @@
 #   Modified 2026-11-27 (Community Fork): Added multi-disk backup checkbox
 #   selection, per-drive destination folder naming, and batch backup execution
 #   wiring (GPL-3.0-or-later).
+#   Modified 2026-11-28 (Community Fork): zstd (level 3) is now the default
+#   GUI compression format (GPL-3.0-or-later).
 # ----------------------------------------------------------------------
 #   This program is free software: you can redistribute it and/or modify
 #   it under the terms of the GNU General Public License as published by
@@ -136,10 +138,12 @@ class Handler:
 
         # Initialize compression tool option
         self.compression_tool_list = self.builder.get_object("compression_tool_list")
+        # Community Fork v1.1: zstd (level 3) is the GUI default (faster & smaller
+        # than gzip); gzip remains available for maximum legacy compatibility.
         self.compression_tool_list.append(
-            ["gzip", _("gzip") + " " + "(" + _("default") + ")"]
+            ["zstd", _("zstandard") + " " + "(" + _("default") + ")"]
         )
-        self.compression_tool_list.append(["zstd", _("zstandard")])
+        self.compression_tool_list.append(["gzip", _("gzip")])
         self.compression_tool_list.append(["bzip2", _("bzip2")])
         self.compression_tool_list.append(
             ["uncompressed", _("Uncompressed (Suitable for use with Image Explorer)")]

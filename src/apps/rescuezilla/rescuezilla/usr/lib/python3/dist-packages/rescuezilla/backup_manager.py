@@ -7,6 +7,9 @@
 #   (GPL-3.0-or-later).
 #   Modified 2026-11-27 (Community Fork): Added multi-disk sequential batch
 #   backup with per-disk destination folder naming (GPL-3.0-or-later).
+#   Modified 2026-11-28 (Community Fork): seekable_compressor telemetry
+#   logging, os-prober cancel cleanup ordering (SIGKILL before lazy umount),
+#   and testable 3-process pipeline spawn helper (GPL-3.0-or-later).
 # ----------------------------------------------------------------------
 #   This program is free software: you can redistribute it and/or modify
 #   it under the terms of the GNU General Public License as published by
@@ -34,7 +37,7 @@ import traceback
 from datetime import datetime
 from time import sleep
 import re
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 from ui_manager import UiManager
 from logger import Logger
@@ -251,6 +254,124 @@ class _BackupCancelledError(Exception):
     """Internal control-flow signal raised when user cancels during a metadata command."""
 
 
+SEEKABLE_COMPRESSOR_STATS_PREFIX = "[seekable_compressor]"
+
+
+def _is_listed_in_proc_mounts(path: str) -> bool:
+    """True if `path` is a mountpoint in /proc/self/mounts (no stat(), so it also
+    detects dead FUSE mounts where lstat() fails with ENOTCONN)."""
+    target = os.path.normpath(path)
+    try:
+        with open("/proc/self/mounts", "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                fields = line.split()
+                if len(fields) >= 2:
+                    # /proc/mounts octal-escapes spaces etc. (e.g. "\040")
+                    mnt = re.sub(
+                        r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), fields[1]
+                    )
+                    if os.path.normpath(mnt) == target:
+                        return True
+    except OSError:
+        return False
+    return False
+
+
+def extract_seekable_compressor_stats(stderr_text: str) -> List[str]:
+    """Return the `[seekable_compressor] ...` telemetry lines found in stderr text."""
+    if not stderr_text:
+        return []
+    return [
+        line.strip()
+        for line in stderr_text.splitlines()
+        if line.strip().startswith(SEEKABLE_COMPRESSOR_STATS_PREFIX)
+    ]
+
+
+def strip_seekable_compressor_stats(stderr_text: str) -> str:
+    """Remove benign `[seekable_compressor]` telemetry lines from stderr text."""
+    if not stderr_text:
+        return ""
+    kept = [
+        line
+        for line in stderr_text.splitlines()
+        if not line.strip().startswith(SEEKABLE_COMPRESSOR_STATS_PREFIX)
+    ]
+    return "\n".join(kept).strip()
+
+
+def spawn_backup_pipeline(
+    partclone_cmd_list,
+    compression_cmd_list,
+    split_cmd_list,
+    env,
+    comp_stderr_file,
+    split_stderr_file,
+):
+    """Spawn `partclone | compressor | split` and return (p_partclone, p_comp, p_split).
+
+    The parent's copies of each intermediate stdout pipe are closed immediately
+    after the downstream process is spawned, so an upstream writer receives
+    SIGPIPE/EPIPE (instead of deadlocking) if a downstream process exits early
+    (e.g. compressor crash or `split` hitting a full disk). On any spawn
+    failure, already-started processes are terminated and their pipes closed.
+    """
+    p_partclone = None
+    p_comp = None
+    p_split = None
+    try:
+        p_partclone = subprocess.Popen(
+            partclone_cmd_list,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            encoding="utf-8",
+        )
+        p_comp = subprocess.Popen(
+            compression_cmd_list,
+            stdin=p_partclone.stdout,
+            stdout=subprocess.PIPE,
+            stderr=comp_stderr_file,
+            env=env,
+            encoding="utf-8",
+        )
+        # Close parent's copy of p_partclone.stdout immediately so p_partclone
+        # receives SIGPIPE instead of deadlocking if p_comp exits early!
+        p_partclone.stdout.close()
+        p_split = subprocess.Popen(
+            split_cmd_list,
+            stdin=p_comp.stdout,
+            stdout=subprocess.DEVNULL,
+            stderr=split_stderr_file,
+            env=env,
+            encoding="utf-8",
+        )
+        # Close parent's copy of p_comp.stdout immediately so p_comp receives
+        # SIGPIPE instead of deadlocking if p_split exits early (e.g. disk full)!
+        p_comp.stdout.close()
+    except Exception:
+        for spawned in (p_split, p_comp, p_partclone):
+            if spawned is not None:
+                try:
+                    if spawned.poll() is None:
+                        spawned.terminate()
+                        spawned.wait(timeout=3.0)
+                except Exception:
+                    try:
+                        spawned.kill()
+                        spawned.wait(timeout=2.0)
+                    except Exception:
+                        pass
+                for pipe in (spawned.stdout, spawned.stderr):
+                    if pipe is not None:
+                        try:
+                            pipe.close()
+                        except Exception:
+                            pass
+        raise
+    return p_partclone, p_comp, p_split
+
+
 # Signals should automatically propagate to processes called with subprocess.run().
 # TODO: This class uses 'subprocess.call', which provides exit code but not stdout/stderr. It would be
 # TODO: VERY useful to display stdout/stderr when the exit code is non-zero, like the RestoreManager does.
@@ -279,6 +400,17 @@ class BackupManager:
                 logger.write(message)
             except Exception:
                 print(message)
+
+    def _log_compression_telemetry(
+        self, partition_key: str, comp_rc, compression_stderr: str
+    ) -> List[str]:
+        """Log `[seekable_compressor]` stats lines into clonezilla-img when comp_rc == 0."""
+        if comp_rc != 0:
+            return []
+        lines = extract_seekable_compressor_stats(compression_stderr)
+        for line in lines:
+            self._log("Compression telemetry (" + partition_key + "): " + line + "\n")
+        return lines
 
     def _run_cancellable(
         self,
@@ -400,17 +532,9 @@ class BackupManager:
                     if res_pk.returncode != 0 and not os.path.ismount(os_prober_mnt):
                         break
                     sleep(0.2)
-                if os.path.exists(os_prober_mnt) and os.path.ismount(os_prober_mnt):
-                    try:
-                        subprocess.run(
-                            ["umount", "-l", os_prober_mnt],
-                            check=False,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            timeout=5.0,
-                        )
-                    except Exception:
-                        pass
+                # L1: SIGKILL any surviving grub-mount FIRST, then lazily detach the
+                # mountpoint, so a killed FUSE daemon never leaves a stale
+                # "Transport endpoint is not connected" mount behind.
                 try:
                     subprocess.run(
                         [
@@ -426,6 +550,21 @@ class BackupManager:
                     )
                 except Exception:
                     pass
+                # os.path.ismount() returns False when lstat() fails with ENOTCONN on a
+                # dead FUSE mount, so also consult the kernel mount table directly.
+                if os.path.ismount(os_prober_mnt) or _is_listed_in_proc_mounts(
+                    os_prober_mnt
+                ):
+                    try:
+                        subprocess.run(
+                            ["umount", "-l", os_prober_mnt],
+                            check=False,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=5.0,
+                        )
+                    except Exception:
+                        pass
 
         if self.requested_stop:
             raise _BackupCancelledError()
@@ -2140,6 +2279,7 @@ class BackupManager:
                     compression_format,
                     self.compression_dict["level"],
                     seekidx_path,
+                    print_stats=True,
                 )
             else:
                 compression_cmd_list = Utility.get_compression_cmd_list(
@@ -2257,56 +2397,14 @@ class BackupManager:
             p_comp = None
             p_split = None
             try:
-                try:
-                    p_partclone = subprocess.Popen(
-                        partclone_cmd_list,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        env=env,
-                        encoding="utf-8",
-                    )
-                    p_comp = subprocess.Popen(
-                        compression_cmd_list,
-                        stdin=p_partclone.stdout,
-                        stdout=subprocess.PIPE,
-                        stderr=comp_stderr_file,
-                        env=env,
-                        encoding="utf-8",
-                    )
-                    # Close parent's copy of p_partclone.stdout immediately so p_partclone
-                    # receives SIGPIPE instead of deadlocking if p_comp exits early!
-                    p_partclone.stdout.close()
-                    p_split = subprocess.Popen(
-                        split_cmd_list,
-                        stdin=p_comp.stdout,
-                        stdout=subprocess.DEVNULL,
-                        stderr=split_stderr_file,
-                        env=env,
-                        encoding="utf-8",
-                    )
-                    # Close parent's copy of p_comp.stdout immediately so p_comp receives
-                    # SIGPIPE instead of deadlocking if p_split exits early (e.g. disk full)!
-                    p_comp.stdout.close()
-                except Exception:
-                    for spawned in (p_split, p_comp, p_partclone):
-                        if spawned is not None:
-                            try:
-                                if spawned.poll() is None:
-                                    spawned.terminate()
-                                    spawned.wait(timeout=3.0)
-                            except Exception:
-                                try:
-                                    spawned.kill()
-                                    spawned.wait(timeout=2.0)
-                                except Exception:
-                                    pass
-                            for pipe in (spawned.stdout, spawned.stderr):
-                                if pipe is not None:
-                                    try:
-                                        pipe.close()
-                                    except Exception:
-                                        pass
-                    raise
+                p_partclone, p_comp, p_split = spawn_backup_pipeline(
+                    partclone_cmd_list,
+                    compression_cmd_list,
+                    split_cmd_list,
+                    env,
+                    comp_stderr_file,
+                    split_stderr_file,
+                )
                 with self._proc_lock:
                     self.proc["partclone_backup_" + partition_key] = p_partclone
                     self.proc["compression_" + partition_key] = p_comp
@@ -2385,6 +2483,12 @@ class BackupManager:
                     .decode("utf-8", errors="replace")
                     .strip()
                 )
+                # Record seekable_compressor --print-stats telemetry into clonezilla-img
+                # only when the entire partition pipeline succeeded.
+                if p_partclone.returncode == 0 and comp_rc == 0 and split_rc == 0:
+                    self._log_compression_telemetry(
+                        partition_key, comp_rc, compression_stderr
+                    )
             finally:
                 try:
                     comp_stderr_file.close()
@@ -2413,18 +2517,23 @@ class BackupManager:
                     + "The output of the command was: "
                     + partclone_stderr
                 )
-                if compression_stderr:
+                compression_error_stderr = (
+                    compression_stderr
+                    if comp_rc != 0
+                    else strip_seekable_compressor_stats(compression_stderr)
+                )
+                if compression_error_stderr:
                     extra_info += (
                         "\n\n"
                         + str(compression_cmd_list)
                         + " stderr: "
-                        + compression_stderr
+                        + compression_error_stderr
                     )
                     self._log(
                         "Compression stderr ("
                         + partition_key
                         + "): "
-                        + compression_stderr
+                        + compression_error_stderr
                     )
                 if split_stderr:
                     extra_info += (

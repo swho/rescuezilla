@@ -1,5 +1,7 @@
 # ----------------------------------------------------------------------
 #   Copyright (C) 2026 Rescuezilla Seekable-Index Community Fork Contributors
+#   Modified 2026-11-28 (Community Fork): os-prober cancel cleanup order,
+#   pipeline early-close, telemetry and zstd GUI default tests.
 # ----------------------------------------------------------------------
 #   This program is free software: you can redistribute it and/or modify
 #   it under the terms of the GNU General Public License as published by
@@ -561,6 +563,505 @@ class MultiDriveBackupTest(unittest.TestCase):
             any("Stopping" in m for m in real_ui.status_messages),
             real_ui.status_messages,
         )
+
+
+class _FakeCompletedRun:
+    def __init__(self, returncode):
+        self.returncode = returncode
+
+
+class _FakeOsProberProc:
+    """Fake os-prober Popen whose communicate() simulates a user cancel mid-run."""
+
+    def __init__(self, bm):
+        self._bm = bm
+        self.pid = 999999
+        self.returncode = 0
+
+    def communicate(self, timeout=None):
+        self._bm.requested_stop = True
+        return "", ""
+
+    def poll(self):
+        return 0
+
+
+class OsProberCancelCleanupTest(unittest.TestCase):
+    """L1: os-prober cancel cleanup must SIGKILL grub-mount BEFORE final umount -l."""
+
+    MNT = "/var/lib/os-prober/mount"
+
+    def _run_cleanup(self, ismount_value, proc_mounts_value, pkill_term_rc=0):
+        from backup_manager import _BackupCancelledError
+
+        bm = BackupManager(
+            ui_manager=_RecordingUiManager(), human_readable_version="test-ver"
+        )
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            if cmd[0] == "umount" and "-l" not in cmd:
+                return _FakeCompletedRun(32)  # busy
+            if cmd[0] == "pkill" and cmd[1] == "-TERM":
+                return _FakeCompletedRun(pkill_term_rc)
+            return _FakeCompletedRun(0)
+
+        real_exists = os.path.exists
+        real_ismount = os.path.ismount
+
+        def fake_exists(p):
+            return True if p == self.MNT else real_exists(p)
+
+        def fake_ismount(p):
+            return ismount_value if p == self.MNT else real_ismount(p)
+
+        with (
+            patch(
+                "backup_manager.subprocess.Popen",
+                side_effect=lambda *a, **k: _FakeOsProberProc(bm),
+            ),
+            patch("backup_manager.subprocess.run", side_effect=fake_run),
+            patch("backup_manager.os.path.exists", side_effect=fake_exists),
+            patch("backup_manager.os.path.ismount", side_effect=fake_ismount),
+            patch(
+                "backup_manager._is_listed_in_proc_mounts",
+                return_value=proc_mounts_value,
+            ),
+            patch("backup_manager.sleep"),
+        ):
+            with self.assertRaises(_BackupCancelledError):
+                bm._run_cancellable(
+                    "Running os-prober", ["os-prober"], use_c_locale=True
+                )
+        return calls
+
+    def test_persistent_mount_kills_before_final_lazy_umount(self):
+        calls = self._run_cleanup(ismount_value=True, proc_mounts_value=True)
+        kill_cmd = ["pkill", "-KILL", "-f", "grub-mount.*/var/lib/os-prober/mount"]
+        lazy_cmd = ["umount", "-l", self.MNT]
+        self.assertIn(kill_cmd, calls)
+        # Final two cleanup commands: SIGKILL first, then lazy umount
+        self.assertEqual(calls[-2:], [kill_cmd, lazy_cmd])
+        self.assertLess(
+            calls.index(kill_cmd), len(calls) - 1 - calls[::-1].index(lazy_cmd)
+        )
+        # Retry loop: synchronous umount attempted before pkill -TERM each round
+        self.assertEqual(calls[0], ["umount", self.MNT])
+        term_idx = [i for i, c in enumerate(calls) if c[:2] == ["pkill", "-TERM"]]
+        self.assertEqual(len(term_idx), 4)
+
+    def test_dead_fuse_mount_still_lazily_unmounted(self):
+        # Dead FUSE mount: lstat() -> ENOTCONN so os.path.ismount() is False,
+        # but /proc/self/mounts still lists it -> final umount -l MUST still run.
+        calls = self._run_cleanup(ismount_value=False, proc_mounts_value=True)
+        self.assertEqual(
+            calls[-2:],
+            [
+                ["pkill", "-KILL", "-f", "grub-mount.*/var/lib/os-prober/mount"],
+                ["umount", "-l", self.MNT],
+            ],
+        )
+
+    def test_clean_unmount_skips_final_lazy_umount(self):
+        calls = self._run_cleanup(
+            ismount_value=False, proc_mounts_value=False, pkill_term_rc=1
+        )
+        self.assertEqual(
+            calls[-1], ["pkill", "-KILL", "-f", "grub-mount.*/var/lib/os-prober/mount"]
+        )
+        self.assertNotIn(["umount", "-l", self.MNT], calls)
+
+    def test_is_listed_in_proc_mounts(self):
+        from unittest.mock import mock_open
+        from backup_manager import _is_listed_in_proc_mounts
+
+        if os.path.exists("/proc/self/mounts"):
+            self.assertTrue(_is_listed_in_proc_mounts("/"))
+        self.assertFalse(_is_listed_in_proc_mounts("/nonexistent/rescuezilla-xyz"))
+        fake = (
+            "/dev/sda1 / ext4 rw 0 0\n"
+            "/dev/sda2 /var/lib/os-prober/mount fuse rw 0 0\n"
+            "/dev/sdb1 /media/my\\040disk vfat rw 0 0\n"
+        )
+        with patch("builtins.open", mock_open(read_data=fake)):
+            self.assertTrue(_is_listed_in_proc_mounts(self.MNT))
+            self.assertTrue(_is_listed_in_proc_mounts(self.MNT + "/"))
+            self.assertTrue(_is_listed_in_proc_mounts("/media/my disk"))
+            self.assertFalse(_is_listed_in_proc_mounts("/var/lib/os-prober"))
+        with patch("builtins.open", side_effect=OSError("no procfs")):
+            self.assertFalse(_is_listed_in_proc_mounts("/"))
+
+
+class BackupPipelineTest(unittest.TestCase):
+    """Early pipe closing (deadlock prevention) and compression telemetry logging."""
+
+    def setUp(self):
+        import tempfile as _tf
+
+        self.comp_err = _tf.TemporaryFile(mode="w+b")
+        self.split_err = _tf.TemporaryFile(mode="w+b")
+        self.addCleanup(self.comp_err.close)
+        self.addCleanup(self.split_err.close)
+
+    def _wait_all(self, procs, timeout=20.0):
+        import subprocess
+
+        rcs = []
+        for p in procs:
+            try:
+                rcs.append(p.wait(timeout=timeout))
+            except subprocess.TimeoutExpired:
+                for q in procs:
+                    q.kill()
+                self.fail("Pipeline deadlocked (process did not exit in time)")
+            if p.stderr is not None:
+                p.stderr.close()
+        return rcs
+
+    def test_parent_closes_intermediate_stdout_immediately_after_downstream_spawn(
+        self,
+    ):
+        from unittest.mock import MagicMock
+        from backup_manager import spawn_backup_pipeline
+
+        events = []
+        names = iter(["partclone", "comp", "split"])
+
+        def fake_popen(cmd, **kwargs):
+            name = next(names)
+            events.append(("spawn", name, kwargs.get("stdin")))
+            proc = MagicMock(name=name)
+            proc.stdout.close.side_effect = lambda n=name: events.append(
+                ("close_stdout", n, None)
+            )
+            return proc
+
+        with patch("backup_manager.subprocess.Popen", side_effect=fake_popen):
+            p_pc, p_comp, p_split = spawn_backup_pipeline(
+                ["partclone.ext4"], ["comp"], ["split"], {}, self.comp_err, None
+            )
+        self.assertEqual(
+            [(e[0], e[1]) for e in events],
+            [
+                ("spawn", "partclone"),
+                ("spawn", "comp"),
+                ("close_stdout", "partclone"),
+                ("spawn", "split"),
+                ("close_stdout", "comp"),
+            ],
+        )
+        # Downstream stdin wired to upstream stdout
+        self.assertIs(events[1][2], p_pc.stdout)
+        self.assertIs(events[3][2], p_comp.stdout)
+        p_split.stdout.close.assert_not_called()
+
+    def test_downstream_early_exit_does_not_deadlock(self):
+        import sys
+        from backup_manager import spawn_backup_pipeline
+
+        # Writes forever until EPIPE; os._exit() avoids the exit-time flush on a
+        # broken pipe so the exit code is deterministic (141).
+        endless_writer_src = "\n".join(
+            [
+                "import os, sys",
+                "b = b'x' * 65536",
+                "try:",
+                "    while True:",
+                "        sys.stdout.buffer.write(b)",
+                "except BrokenPipeError:",
+                "    os._exit(141)",
+            ]
+        )
+        endless_writer = [sys.executable, "-c", endless_writer_src]
+        passthrough = [sys.executable, "-c", endless_writer_src]
+        exit_now = [sys.executable, "-c", "import sys; sys.exit(3)"]
+
+        # (a) compressor dies immediately -> partclone gets EPIPE, no hang
+        procs = spawn_backup_pipeline(
+            endless_writer,
+            exit_now,
+            [sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
+            None,
+            self.comp_err,
+            self.split_err,
+        )
+        rcs = self._wait_all(procs)
+        self.assertEqual(rcs[1], 3)
+        self.assertEqual(rcs[0], 141)
+        self.assertEqual(rcs[2], 0)
+
+        # (b) split dies immediately (e.g. disk full) -> compressor gets EPIPE, no hang
+        procs = spawn_backup_pipeline(
+            [sys.executable, "-c", "pass"],
+            passthrough,
+            exit_now,
+            None,
+            self.comp_err,
+            self.split_err,
+        )
+        rcs = self._wait_all(procs)
+        self.assertEqual(rcs[2], 3)
+        self.assertEqual(rcs[1], 141)
+
+    def test_spawn_failure_terminates_started_processes(self):
+        import sys
+        from backup_manager import spawn_backup_pipeline
+
+        started = []
+        import subprocess as _sp
+
+        real_popen = _sp.Popen
+
+        def tracking_popen(*a, **k):
+            p = real_popen(*a, **k)
+            started.append(p)
+            return p
+
+        with patch("backup_manager.subprocess.Popen", side_effect=tracking_popen):
+            with self.assertRaises(FileNotFoundError):
+                spawn_backup_pipeline(
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    ["/nonexistent/rescuezilla-split-binary"],
+                    None,
+                    self.comp_err,
+                    self.split_err,
+                )
+        self.assertEqual(len(started), 2)
+        for p in started:
+            self.assertIsNotNone(p.poll())
+
+    def _make_bm_with_clonezilla_img(self, td):
+        from logger import Logger
+
+        bm = BackupManager(
+            ui_manager=_RecordingUiManager(), human_readable_version="test-ver"
+        )
+        log_path = os.path.join(td, "clonezilla-img")
+        bm.logger = Logger(log_path)
+        self.addCleanup(bm.logger.close)
+        return bm, log_path
+
+    def _read_stderr(self, f):
+        f.seek(0)
+        return f.read(65536).decode("utf-8", errors="replace").strip()
+
+    def test_seekable_compressor_telemetry_logged_into_clonezilla_img(self):
+        import shutil
+        import sys
+        from backup_manager import (
+            extract_seekable_compressor_stats,
+            spawn_backup_pipeline,
+        )
+        from utility import Utility
+
+        if not shutil.which("split"):
+            self.skipTest("GNU split not installed")
+        with tempfile.TemporaryDirectory() as td:
+            bm, log_path = self._make_bm_with_clonezilla_img(td)
+            idx = os.path.join(td, Utility.get_seekable_index_filename("sda1"))
+            comp_cmd = Utility.get_seekable_compression_cmd_list(
+                "gzip", 3, idx, print_stats=True
+            )
+            self.assertEqual(comp_cmd[-1], "--print-stats")
+            fake_partclone = [
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.buffer.write(b'partclone data ' * 200000)",
+            ]
+            split_cmd = [
+                "split",
+                "--suffix-length=2",
+                "--bytes=1048576",
+                "-",
+                os.path.join(td, "sda1.ext4-ptcl-img.gz."),
+            ]
+            procs = spawn_backup_pipeline(
+                fake_partclone,
+                comp_cmd,
+                split_cmd,
+                None,
+                self.comp_err,
+                self.split_err,
+            )
+            rcs = self._wait_all(procs)
+            self.assertEqual(rcs, [0, 0, 0])
+            comp_stderr = self._read_stderr(self.comp_err)
+            self.assertEqual(len(extract_seekable_compressor_stats(comp_stderr)), 1)
+
+            lines = bm._log_compression_telemetry("/dev/sda1", 0, comp_stderr)
+            self.assertEqual(len(lines), 1)
+            self.assertTrue(lines[0].startswith("[seekable_compressor] fmt=gzip"))
+            bm.logger.close()
+            with open(log_path) as fh:
+                content = fh.read()
+            self.assertIn(
+                "Compression telemetry (/dev/sda1): [seekable_compressor]", content
+            )
+            self.assertIn("in_bytes=3000000", content)
+
+    def test_failed_compression_keeps_stderr_and_logs_no_telemetry(self):
+        import sys
+        from backup_manager import spawn_backup_pipeline
+
+        with tempfile.TemporaryDirectory() as td:
+            bm, log_path = self._make_bm_with_clonezilla_img(td)
+            failing_comp = [
+                sys.executable,
+                "-c",
+                "import sys; sys.stdin.buffer.read(); "
+                "sys.stderr.write('[seekable_compressor] fmt=gzip partial\\n"
+                "seekable_compressor error: simulated ENOSPC\\n'); sys.exit(1)",
+            ]
+            procs = spawn_backup_pipeline(
+                [sys.executable, "-c", "print('x' * 1000)"],
+                failing_comp,
+                [sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
+                None,
+                self.comp_err,
+                self.split_err,
+            )
+            rcs = self._wait_all(procs)
+            self.assertEqual(rcs[1], 1)
+            comp_stderr = self._read_stderr(self.comp_err)
+            # Full stderr still captured for the failure report
+            self.assertIn("seekable_compressor error: simulated ENOSPC", comp_stderr)
+            self.assertEqual(
+                bm._log_compression_telemetry("/dev/sda1", 1, comp_stderr), []
+            )
+            bm.logger.close()
+            with open(log_path) as fh:
+                self.assertNotIn("Compression telemetry", fh.read())
+
+    def test_strip_seekable_compressor_stats_on_partclone_failure(self):
+        from backup_manager import strip_seekable_compressor_stats
+
+        only_stats = (
+            "[seekable_compressor] fmt=zstd level=3 backend=libzstd workers=16 "
+            "frame_size=4194304 frames=1 in_bytes=0 out_bytes=13 ratio=0.00% "
+            "elapsed=0.001s in_MBps=0.00 out_MBps=0.01\n"
+        )
+        self.assertEqual(strip_seekable_compressor_stats(only_stats), "")
+        mixed = only_stats + "real warning line\n"
+        self.assertEqual(strip_seekable_compressor_stats(mixed), "real warning line")
+
+    def test_backup_manager_source_wiring(self):
+        # The partition loop must request --print-stats, use the pipeline helper,
+        # gate telemetry on full pipeline success, and strip telemetry from comp_rc==0 error text.
+        import backup_manager
+
+        with open(backup_manager.__file__, encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("print_stats=True", src)
+        self.assertIn("= spawn_backup_pipeline(", src)
+        self.assertIn(
+            "if p_partclone.returncode == 0 and comp_rc == 0 and split_rc == 0:", src
+        )
+        self.assertIn("strip_seekable_compressor_stats(compression_stderr)", src)
+        tele = src.index("self._log_compression_telemetry(\n")
+        fail = src.index("if p_partclone.returncode != 0 or comp_rc != 0")
+        self.assertLess(tele, fail)
+
+
+class HandlerDefaultCompressionTest(unittest.TestCase):
+    """P2a: GUI default compression is zstd (level 3), verified without X11/GTK."""
+
+    def test_zstd_is_index0_default_with_level_3(self):
+        import ast
+
+        handler_path = os.path.join(os.path.dirname(__file__), "..", "handler.py")
+        with open(handler_path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        handler_cls = next(
+            n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Handler"
+        )
+        funcs = {n.name: n for n in handler_cls.body if isinstance(n, ast.FunctionDef)}
+
+        identity_ns = {"_": lambda s: s}
+        rows = []
+        set_active_args = []
+        # ast.walk() is breadth-first, so sort calls by source position
+        calls = sorted(
+            (
+                n
+                for n in ast.walk(funcs["__init__"])
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            ),
+            key=lambda n: (n.lineno, n.col_offset),
+        )
+        for node in calls:
+            target = ast.unparse(node.func.value)
+            if target == "self.compression_tool_list" and node.func.attr == "append":
+                rows.append(eval(ast.unparse(node.args[0]), identity_ns))
+            if (
+                target == "compression_format_combobox"
+                and node.func.attr == "set_active"
+            ):
+                set_active_args.append(ast.literal_eval(node.args[0]))
+        self.assertEqual(
+            rows,
+            [
+                ["zstd", "zstandard (default)"],
+                ["gzip", "gzip"],
+                ["bzip2", "bzip2"],
+                ["uncompressed", "Uncompressed (Suitable for use with Image Explorer)"],
+            ],
+        )
+        self.assertEqual(set_active_args, [0])
+
+        # Execute the real compression_tool_changed() against fake GTK widgets
+        mod = ast.Module(body=[funcs["compression_tool_changed"]], type_ignores=[])
+
+        class _FakeGtk:
+            class PositionType:
+                TOP = "TOP"
+
+        ns = {"_": lambda s: s, "Gtk": _FakeGtk}
+        exec(compile(mod, handler_path, "exec"), ns)
+
+        class _Recorder:
+            def __init__(self):
+                self.calls = []
+
+            def __getattr__(self, name):
+                return lambda *a, **k: self.calls.append((name, a, k))
+
+        scale, box = _Recorder(), _Recorder()
+        objects = {
+            "backup_step6_compression_level_scale": scale,
+            "backup_step6_compression_level_selection_box": box,
+        }
+
+        class _FakeBuilder:
+            def get_object(self, name):
+                return objects[name]
+
+        class _FakeHandler:
+            builder = _FakeBuilder()
+
+        fake_self = _FakeHandler()
+
+        class _Combo:
+            def __init__(self, model):
+                self._model = model
+                self._active = None
+
+            def set_active(self, i):
+                self._active = i
+
+            def get_active_iter(self):
+                return self._active
+
+            def get_model(self):
+                return self._model
+
+        combo = _Combo(rows)
+        combo.set_active(0)
+        ns["compression_tool_changed"](fake_self, combo)
+        self.assertIn(("set_range", (1, 19), {}), scale.calls)
+        self.assertIn(("set_value", (3,), {}), scale.calls)
+        self.assertIn(("set_visible", (True,), {}), box.calls)
 
 
 if __name__ == "__main__":

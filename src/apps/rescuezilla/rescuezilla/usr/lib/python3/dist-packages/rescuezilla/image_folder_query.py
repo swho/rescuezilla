@@ -2,6 +2,9 @@
 #   Copyright (C) 2012 RedoBackup.org
 #   Copyright (C) 2003-2025 Steven Shiau <steven _at_ clonezilla org>
 #   Copyright (C) 2019-2025 Rescuezilla.com <rescuezilla@gmail.com>
+#   Modified 2026-11-28 (Community Fork): SeekZilla v2.2 scan-complete
+#   callback (set_on_scan_complete_callback) used by the Step 4 Backup Mode
+#   & Differential Base UI (GPL-3.0-or-later).
 # ----------------------------------------------------------------------
 #   This program is free software: you can redistribute it and/or modify
 #   it under the terms of the GNU General Public License as published by
@@ -98,6 +101,13 @@ class ImageFolderQuery:
         self.requested_stop_lock = threading.Lock()
         self.requested_stop = False
         self.image_folder_query_in_progress = False
+        self.on_scan_complete_callback = None
+
+    def set_on_scan_complete_callback(self, callback):
+        """`callback()` runs on the GTK main thread after every folder scan
+        (at the end of _populate_image_list_table, after the please-wait popup
+        is destroyed). Pass None to remove it."""
+        self.on_scan_complete_callback = callback
 
     def is_stop_requested(self):
         with self.requested_stop_lock:
@@ -197,6 +207,14 @@ class ImageFolderQuery:
                 error_heading=_("Error processing the following images:"),
             )
         self.please_wait_popup.destroy()
+        callback = getattr(self, "on_scan_complete_callback", None)
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                traceback.print_exc()
+        # GLib.idle_add: run once
+        return False
 
     def scan_file(self, absolute_path, enduser_filename):
         print("Scan file " + absolute_path)

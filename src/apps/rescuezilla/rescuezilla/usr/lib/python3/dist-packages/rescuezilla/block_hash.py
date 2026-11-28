@@ -4,6 +4,9 @@
 #   Derived from Rescuezilla (Copyright (C) 2019-2025 Rescuezilla.com)
 #   Added 2026-11-28 (Community Fork): SeekZilla Phase 1 block-hash index
 #   (.rzbhash) for Partclone v0002 images (GPL-3.0-or-later).
+#   Modified 2026-11-28 (Community Fork): SeekZilla v2.2 cancellable,
+#   progress-reporting retroactive builder with bounded multi-core `.rzidx`
+#   frame decoding and inspect_base_dir_bhash_status() (GPL-3.0-or-later).
 # ----------------------------------------------------------------------
 #   This program is free software: you can redistribute it and/or modify
 #   it under the terms of the GNU General Public License as published by
@@ -32,12 +35,18 @@ Usable both as `import block_hash` (package dir on `sys.path`) and as
 
 import argparse
 import array
+import bisect
+import collections
+import concurrent.futures
 import glob
 import hashlib
 import os
 import re
+import stat
 import struct
 import sys
+import tempfile
+import time
 import zlib
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence, Tuple, Union
@@ -118,6 +127,15 @@ class ChunkGeometryError(ValueError):
     """Requested `.rzbhash` chunk size is incompatible with the image geometry."""
 
 
+class BhashBuildCancelledError(Exception):
+    """A retroactive `.rzbhash` build was cancelled through its `cancel_event`.
+
+    Raised before anything is written: no output file and no temp file remain.
+    Deliberately NOT a ValueError so generic error handlers never mistake a
+    user cancel for a corrupt image.
+    """
+
+
 def partclone_crc32(data, prev_crc: Optional[int] = None) -> int:
     """Partclone CSM_CRC32 value (zlib CRC-32 without the final XOR).
 
@@ -144,20 +162,33 @@ def normalize_fs_name(fs) -> bytes:
 
 
 def atomic_write_bytes(path, data) -> None:
-    """Atomically write `data`: `<path>.tmp.<pid>` + fsync + os.replace.
+    """Atomically write `data` via an exclusive random temp file + fsync + os.replace.
 
-    The temp file is unlinked on any error, so `path` is either the old file
-    or the complete new file, never a partial one.
+    Uses `tempfile.mkstemp` (`O_CREAT | O_EXCL`) inside the target directory so
+    symlink pre-creation / predictable temp-name attacks cannot redirect writes,
+    and unlinks the temp file on any error so `path` is never partial.
     """
     path = os.fspath(path)
     out_dir = os.path.dirname(os.path.abspath(path))
     os.makedirs(out_dir, exist_ok=True)
-    tmp = f"{path}.tmp.{os.getpid()}"
+    fd, tmp = tempfile.mkstemp(
+        prefix="." + os.path.basename(path) + ".tmp.",
+        dir=out_dir,
+    )
     try:
-        with open(tmp, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
+        try:
+            with os.fdopen(fd, "wb") as f:
+                fd = None
+                f.write(data)
+                f.flush()
+                try:
+                    os.fchmod(f.fileno(), 0o644)
+                except OSError:
+                    pass
+                os.fsync(f.fileno())
+        finally:
+            if fd is not None:
+                os.close(fd)
         os.replace(tmp, path)
         tmp = None
         try:
@@ -720,6 +751,54 @@ def load_bhash_file(path) -> BlockHashIndex:
     return parse_bhash_bytes(raw)
 
 
+def is_bhash_file_valid(path, full_verify: bool = False) -> bool:
+    """True when `path` is a structurally valid `.rzbhash`.
+
+    The quick check (default) reads only the 68-byte header: magic, version,
+    hash algorithm, header CRC32, chunk geometry and the exact file length
+    (this catches truncated / partially written files). `full_verify=True`
+    additionally verifies the SHA-256 trailer via `load_bhash_file`.
+    """
+    path = os.fspath(path)
+    if full_verify:
+        try:
+            load_bhash_file(path)
+        except (BlockHashFormatError, OSError, ValueError):
+            return False
+        return True
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            head = f.read(BHASH_HEADER_SIZE)
+    except OSError:
+        return False
+    if len(head) != BHASH_HEADER_SIZE:
+        return False
+    (
+        magic,
+        version,
+        algo,
+        chunk_size,
+        block_size,
+        totalblock,
+        _device_size,
+        num_chunks,
+        _fs_name,
+        header_crc,
+    ) = _BHASH_HEADER_STRUCT.unpack(head)
+    if magic != BHASH_MAGIC or version != BHASH_VERSION or algo != BHASH_ALGO_SHA256:
+        return False
+    if zlib.crc32(head[:64]) & _MASK32 != header_crc:
+        return False
+    try:
+        cs, _bpc, expect_chunks = compute_chunk_geometry(block_size, totalblock, chunk_size)
+    except ValueError:
+        return False
+    if cs != chunk_size or expect_chunks != num_chunks:
+        return False
+    return size == BHASH_HEADER_SIZE + num_chunks * DIGEST_SIZE + BHASH_TRAILER_SIZE
+
+
 def write_bhash_file(path, bhash_index: BlockHashIndex) -> bytes:
     """Atomically write a `.rzbhash`; returns (and stores) the file's SHA-256."""
     blob = bhash_index.serialize()
@@ -1061,17 +1140,103 @@ class StreamingBlockHashFeed(ChunkSink):
         )
 
 
+PROGRESS_MIN_INTERVAL_SECONDS = 0.2
+
+
+def _check_cancel(cancel_event) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise BhashBuildCancelledError(".rzbhash build cancelled by user")
+
+
+class _ProgressReporter:
+    """Throttled `progress_cb(bytes_done, bytes_total, decompressed_bytes)`.
+
+    Intermediate updates are emitted at most every PROGRESS_MIN_INTERVAL_SECONDS
+    and never with a smaller `bytes_done` than the previous one; `force=True`
+    (used once at the end) always emits.
+    """
+
+    def __init__(self, progress_cb, total, min_interval: Optional[float] = None):
+        self._cb = progress_cb
+        self.total = total
+        if min_interval is None:
+            min_interval = PROGRESS_MIN_INTERVAL_SECONDS  # looked up at call time
+        self._min_interval = float(min_interval)
+        self._last_t = None
+        self._last_done = None
+
+    def update(self, done: int, decompressed: int, force: bool = False) -> None:
+        if self._cb is None:
+            return
+        if self._last_done is not None and done < self._last_done:
+            done = self._last_done
+        now = time.monotonic()
+        if not force and self._last_t is not None:
+            if now - self._last_t < self._min_interval:
+                return
+        self._last_t = now
+        self._last_done = done
+        self._cb(int(done), self.total, int(decompressed))
+
+
+def _stream_compressed_total(stream) -> Optional[int]:
+    total = getattr(stream, "compressed_size", None)
+    return int(total) if isinstance(total, int) else None
+
+
+def _stream_compressed_done(stream, decompressed: int) -> int:
+    """Compressed bytes consumed so far by a SeekableSplitStream (else `decompressed`)."""
+    mode = getattr(stream, "mode", None)
+    try:
+        if mode == "stream":
+            return int(getattr(stream, "_comp_pos"))
+        if mode == "raw":
+            return int(stream.tell())
+        if mode == "index":
+            entries = getattr(stream, "_entries")
+            i = int(getattr(stream, "_frame_idx"))
+            return int(entries[i + 1][0]) if i >= 0 else 0
+    except (AttributeError, IndexError, TypeError, ValueError):
+        pass
+    return int(decompressed)
+
+
 def build_bhash_from_stream(
-    stream, chunk_size: int = DEFAULT_BHASH_CHUNK_SIZE, read_size: int = 4 * 1024 * 1024
+    stream,
+    chunk_size: int = DEFAULT_BHASH_CHUNK_SIZE,
+    read_size: int = 4 * 1024 * 1024,
+    progress_cb=None,
+    cancel_event=None,
 ) -> Optional[BlockHashIndex]:
-    """Build a BlockHashIndex from any readable uncompressed Partclone stream."""
+    """Build a BlockHashIndex from any readable uncompressed Partclone stream.
+
+    `progress_cb(bytes_done, bytes_total, decompressed_bytes)` (optional, throttled)
+    reports compressed bytes consumed for a `SeekableSplitStream` (otherwise
+    `bytes_done == decompressed_bytes` and `bytes_total` is None).
+    `cancel_event` (a `threading.Event`) is polled before every read and raises
+    BhashBuildCancelledError.
+    """
     feed = StreamingBlockHashFeed(chunk_size=chunk_size)
+    reporter = (
+        _ProgressReporter(progress_cb, _stream_compressed_total(stream))
+        if progress_cb is not None
+        else None
+    )
+    decompressed = 0
     while True:
+        _check_cancel(cancel_event)
         piece = stream.read(read_size)
         if not piece:
             break
+        decompressed += len(piece)
         feed.feed(piece)
-    return feed.finish()
+        if reporter is not None:
+            reporter.update(_stream_compressed_done(stream, decompressed), decompressed)
+    _check_cancel(cancel_event)
+    idx = feed.finish()
+    if reporter is not None:
+        reporter.update(_stream_compressed_done(stream, decompressed), decompressed, force=True)
+    return idx
 
 
 # ----------------------------------------------------------------------
@@ -1144,40 +1309,359 @@ def find_ptcl_images(image_dir, include_dd: bool = False) -> List[PtclImageSet]:
     return found
 
 
+# Parallel `.rzidx` frame decoding limits (strict memory bound: at most
+# `workers * PARALLEL_WINDOW_PER_WORKER` frames are read/decoded/queued at once).
+BHASH_PARALLEL_MAX_WORKERS = 8
+PARALLEL_WINDOW_PER_WORKER = 2
+# A sane `.rzidx` frame is 64 KiB..4 MiB; refuse absurd sizes (corrupt/hostile
+# index) instead of allocating them, and fall back to streaming decoding.
+_PARALLEL_MAX_FRAME_BYTES = 64 * 1024 * 1024
+
+
+class _RzidxFallback(ValueError):
+    """The `.rzidx` cannot drive parallel decoding: use sequential streaming."""
+
+
+def resolve_parallel_workers(max_workers: Optional[int] = None) -> int:
+    """Decoder thread count: `min(os.cpu_count() or 2, 8)`, clamped to [1, 8]."""
+    if max_workers is None:
+        max_workers = min(os.cpu_count() or 2, BHASH_PARALLEL_MAX_WORKERS)
+    return max(1, min(int(max_workers), BHASH_PARALLEL_MAX_WORKERS))
+
+
+def _normalize_split_format(compression) -> str:
+    fmt = str(compression).strip().lower()
+    if fmt in ("uncomp", "none"):
+        return "uncompressed"
+    return fmt
+
+
+def _validate_split_paths(paths) -> List[int]:
+    """Ensure every split file is a regular file staying inside its backup folder."""
+    if not paths:
+        raise FileNotFoundError("No split files given")
+    base_real = os.path.realpath(os.path.dirname(os.path.abspath(paths[0])))
+    sizes: List[int] = []
+    for p in paths:
+        real_p = os.path.realpath(p)
+        try:
+            common = os.path.commonpath([base_real, real_p])
+        except ValueError as exc:
+            raise ValueError(f"Split path escapes backup folder: {p!r}") from exc
+        if common != base_real:
+            raise ValueError(f"Split path escapes backup folder: {p!r} -> {real_p!r}")
+        st = os.stat(real_p)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f"Split path is not a regular file: {p!r}")
+        sizes.append(st.st_size)
+    return sizes
+
+
+class _ReadOnlySplitReader:
+    """Sequential-friendly `pread` view over split files, opened strictly O_RDONLY.
+
+    Only one split file descriptor is open at a time (a 2 TB image can have
+    hundreds of splits).
+    """
+
+    def __init__(self, paths):
+        self.paths = [os.fspath(p) for p in paths]
+        self.sizes = _validate_split_paths(self.paths)
+        self.starts: List[int] = []
+        total = 0
+        for size in self.sizes:
+            self.starts.append(total)
+            total += size
+        self.total = total
+        self._fd = None
+        self._fd_idx = -1
+
+    def _open(self, i: int) -> int:
+        if i != self._fd_idx:
+            self.close()
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0)
+            fd = os.open(self.paths[i], flags)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise ValueError(f"Split path is not a regular file: {self.paths[i]!r}")
+            except Exception:
+                os.close(fd)
+                raise
+            self._fd = fd
+            self._fd_idx = i
+        return self._fd
+
+    def read_at(self, offset: int, n: int) -> bytes:
+        parts: List[bytes] = []
+        while n > 0 and offset < self.total:
+            i = bisect.bisect_right(self.starts, offset) - 1
+            fd = self._open(i)
+            rel = offset - self.starts[i]
+            want = min(n, self.sizes[i] - rel)
+            data = os.pread(fd, want, rel)
+            if not data:
+                raise OSError(f"Short read from split file {self.paths[i]}")
+            parts.append(data)
+            offset += len(data)
+            n -= len(data)
+        if not parts:
+            return b""
+        return parts[0] if len(parts) == 1 else b"".join(parts)
+
+    def close(self) -> None:
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+        self._fd = None
+        self._fd_idx = -1
+
+
+def _load_rzidx_frame_entries(sc, fmt: str, seekidx_path, total_compressed: int):
+    """Validated `.rzidx` entries (incl. sentinel) matching the split files.
+
+    Raises _RzidxFallback when the index is unreadable or does not match.
+    """
+    try:
+        with open(seekidx_path, "rb") as f:
+            info = sc.parse_seekidx_bytes(f.read())
+    except (OSError, ValueError) as exc:
+        raise _RzidxFallback(str(exc)) from exc
+    expected_codec = sc.CODEC_GZIP if fmt == "gzip" else sc.CODEC_ZSTD
+    if info["codec"] != expected_codec:
+        raise _RzidxFallback(f"seek index codec {info['codec_name']} does not match {fmt}")
+    if info["total_compressed"] != total_compressed:
+        raise _RzidxFallback(
+            f"seek index total_compressed {info['total_compressed']} != "
+            f"split size {total_compressed}"
+        )
+    entries = info["entries"]
+    if not entries or tuple(entries[0]) != (0, 0):
+        raise _RzidxFallback("seek index does not start at offset 0")
+    if tuple(entries[-1]) != (info["total_compressed"], info["total_uncompressed"]):
+        raise _RzidxFallback("seek index sentinel does not match its totals")
+    for (c0, u0), (c1, u1) in zip(entries, entries[1:]):
+        if c1 < c0 or u1 < u0:
+            raise _RzidxFallback("seek index entries are not monotonic")
+        if (u1 - u0) > _PARALLEL_MAX_FRAME_BYTES or (c1 - c0) > _PARALLEL_MAX_FRAME_BYTES:
+            raise _RzidxFallback("seek index frame is implausibly large")
+    return entries
+
+
+def _build_index_parallel(
+    sc,
+    split_paths,
+    fmt: str,
+    seekidx_path,
+    chunk_size: int,
+    progress_cb,
+    cancel_event,
+    max_workers: Optional[int],
+) -> Optional[BlockHashIndex]:
+    """Decode `.rzidx` frames on a bounded thread pool, feeding them in order.
+
+    Compressed frames are read sequentially (O_RDONLY) on the calling thread;
+    at most `workers * 2` frames are in flight. Raises _RzidxFallback when the
+    index does not describe the split files (caller retries sequentially).
+    """
+    reader = _ReadOnlySplitReader(split_paths)
+    try:
+        entries = _load_rzidx_frame_entries(sc, fmt, seekidx_path, reader.total)
+        decompress = sc.decompress_gzip_frame if fmt == "gzip" else sc.decompress_zstd_frame
+        decode_errors = (getattr(sc, "StreamDecompressError", ValueError),)
+        workers = resolve_parallel_workers(max_workers)
+        window = workers * PARALLEL_WINDOW_PER_WORKER
+        reporter = _ProgressReporter(progress_cb, reader.total)
+        feed = StreamingBlockHashFeed(chunk_size=chunk_size)
+        frame_count = len(entries) - 1
+        pending = collections.deque()
+        decompressed = 0
+        nxt = 0
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="rzbhash-decode"
+        )
+        try:
+            while nxt < frame_count or pending:
+                _check_cancel(cancel_event)
+                while nxt < frame_count and len(pending) < window:
+                    c0, u0 = entries[nxt]
+                    c1, u1 = entries[nxt + 1]
+                    comp = reader.read_at(c0, c1 - c0)
+                    if len(comp) != c1 - c0:
+                        raise _RzidxFallback(f"seekable frame {nxt} is truncated")
+                    pending.append((executor.submit(decompress, comp, u1 - u0), c1, u1 - u0))
+                    del comp
+                    nxt += 1
+                fut, c_end, usize = pending.popleft()
+                try:
+                    data = fut.result()
+                except decode_errors as exc:
+                    raise _RzidxFallback(f"frame decode failed: {exc}") from exc
+                del fut
+                if len(data) != usize:
+                    raise _RzidxFallback("seekable frame is shorter than indexed")
+                feed.feed(data)
+                decompressed += len(data)
+                del data
+                reporter.update(c_end, decompressed)
+        finally:
+            for fut, _c, _u in pending:
+                fut.cancel()
+            pending.clear()
+            try:
+                executor.shutdown(wait=True, cancel_futures=True)
+            except TypeError:  # Python < 3.9
+                executor.shutdown(wait=True)
+        _check_cancel(cancel_event)
+        idx = feed.finish()
+        reporter.update(reader.total, decompressed, force=True)
+        return idx
+    finally:
+        reader.close()
+
+
+def _build_index_sequential(
+    sc, split_paths, compression, chunk_size: int, progress_cb, cancel_event
+) -> Optional[BlockHashIndex]:
+    stream = sc.SeekableSplitStream(split_paths, compression, None)
+    try:
+        return build_bhash_from_stream(
+            stream, chunk_size=chunk_size, progress_cb=progress_cb, cancel_event=cancel_event
+        )
+    finally:
+        stream.close()
+
+
 def build_bhash_from_splits(
     split_paths: Sequence,
     compression: str,
     output_bhash_path,
     chunk_size: int = DEFAULT_BHASH_CHUNK_SIZE,
     seekidx_path=None,
+    progress_cb=None,
+    cancel_event=None,
+    max_workers: Optional[int] = None,
 ) -> Optional[BlockHashIndex]:
     """Retroactively build `.rzbhash` from existing split image files.
 
-    Decompresses sequentially in-process (libzstd / libdeflate / zlib), verifies
-    every Partclone CRC32, and atomically writes `output_bhash_path`. Returns None
-    (writing nothing) for non-Partclone images. The split files are only read.
+    With a valid matching `.rzidx` (gzip / zstd) the independent frames are
+    decoded on up to `min(os.cpu_count(), 8)` threads (libdeflate / libzstd,
+    GIL-free) with a bounded in-flight window and fed in exact order; otherwise
+    (or when the index is absent/unreadable/mismatched) decoding is sequential.
+    Both paths produce bit-for-bit identical output. Every Partclone CRC32 is
+    verified and `output_bhash_path` is written atomically. Returns None
+    (writing nothing) for non-Partclone images. The split files are opened
+    read-only and never modified.
+
+    `progress_cb(bytes_done, bytes_total, decompressed_bytes)` reports compressed
+    bytes read (throttled). When `cancel_event` is set, BhashBuildCancelledError
+    is raised and neither the output nor any temp file is left behind.
     """
     sc = _import_seekable_compressor()
+    split_paths = [os.fspath(p) for p in split_paths]
+    if split_paths:
+        _validate_split_paths(split_paths)
     if seekidx_path is not None and not os.path.isfile(seekidx_path):
         seekidx_path = None
-    try:
-        stream = sc.SeekableSplitStream(split_paths, compression, seekidx_path)
-    except ValueError as exc:
-        if seekidx_path is None:
-            raise
-        # The .rzidx is only an accelerator: fall back to sequential decoding.
-        sys.stderr.write(
-            f"block_hash warning: ignoring unusable seek index {seekidx_path}: {exc}\n"
+    _check_cancel(cancel_event)
+    fmt = _normalize_split_format(compression)
+    idx = None
+    built = False
+    if seekidx_path is not None and fmt in ("gzip", "zstd") and split_paths:
+        try:
+            idx = _build_index_parallel(
+                sc, split_paths, fmt, seekidx_path, chunk_size,
+                progress_cb, cancel_event, max_workers,
+            )
+            built = True
+        except _RzidxFallback as exc:
+            # The .rzidx is only an accelerator: fall back to sequential decoding.
+            sys.stderr.write(
+                f"block_hash warning: ignoring unusable seek index {seekidx_path}: {exc}\n"
+            )
+    if not built:
+        idx = _build_index_sequential(
+            sc, split_paths, compression, chunk_size, progress_cb, cancel_event
         )
-        stream = sc.SeekableSplitStream(split_paths, compression, None)
-    try:
-        idx = build_bhash_from_stream(stream, chunk_size=chunk_size)
-    finally:
-        stream.close()
     if idx is None:
         return None
+    _check_cancel(cancel_event)
     write_bhash_file(output_bhash_path, idx)
     return idx
+
+
+_DIFF_MANIFEST_NAME = "Info-rzdiff-manifest.json"
+BHASH_INDEXABLE_COMPRESSIONS = ("zstd", "gzip", "uncompressed")
+
+
+def is_differential_backup_dir_entries(entries) -> bool:
+    """True for (partial) differential backup folders: never usable as a base."""
+    for e in entries:
+        if e == _DIFF_MANIFEST_NAME or e.endswith("-rzdiff.meta") or "-rzdiff-img." in e:
+            return True
+    return False
+
+
+def inspect_base_dir_bhash_status(base_dir, full_verify: bool = False) -> dict:
+    """Which Partclone partitions of a full backup folder have a valid `.rzbhash`.
+
+    Only `<part>.<fs>-ptcl-img.<zst|gz|uncomp>.aa` images (never partclone.dd)
+    are considered. A `.rzbhash` that is present but structurally invalid
+    (quick header/length check; full SHA-256 check with `full_verify=True`)
+    counts as missing. Differential backup folders report nothing.
+
+    Returns a dict: ptcl_parts, bhash_parts, missing_bhash_parts,
+    missing_images (PtclImageSet list), total_missing_compressed_bytes,
+    invalid_bhash_parts, ready, needs_bhash, is_differential.
+    """
+    status = {
+        "ptcl_parts": [],
+        "bhash_parts": [],
+        "missing_bhash_parts": [],
+        "missing_images": [],
+        "total_missing_compressed_bytes": 0,
+        "invalid_bhash_parts": [],
+        "ready": False,
+        "needs_bhash": False,
+        "is_differential": False,
+    }
+    base_dir = os.fspath(base_dir)
+    try:
+        entries = os.listdir(base_dir)
+    except OSError:
+        return status
+    if is_differential_backup_dir_entries(entries):
+        status["is_differential"] = True
+        return status
+    try:
+        images = find_ptcl_images(base_dir, include_dd=False)
+    except OSError:
+        return status
+    seen = set()
+    for img in images:
+        if img.compression not in BHASH_INDEXABLE_COMPRESSIONS or not img.split_paths:
+            continue
+        if img.short_part in seen:
+            continue
+        seen.add(img.short_part)
+        status["ptcl_parts"].append(img.short_part)
+        bhash_path = os.path.join(base_dir, bhash_index_filename(img.short_part))
+        if os.path.isfile(bhash_path) and is_bhash_file_valid(bhash_path, full_verify):
+            status["bhash_parts"].append(img.short_part)
+            continue
+        if os.path.exists(bhash_path):
+            status["invalid_bhash_parts"].append(img.short_part)
+        status["missing_bhash_parts"].append(img.short_part)
+        status["missing_images"].append(img)
+        for p in img.split_paths:
+            try:
+                status["total_missing_compressed_bytes"] += os.path.getsize(p)
+            except OSError:
+                pass
+    status["needs_bhash"] = bool(status["missing_bhash_parts"])
+    status["ready"] = bool(status["ptcl_parts"]) and not status["needs_bhash"]
+    return status
 
 
 def _cmd_build_from_image(args) -> int:

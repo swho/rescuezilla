@@ -16,6 +16,7 @@
 #   You should have received a copy of the GNU General Public License
 #   along with this program.  If not, see <http://www.gnu.org/licenses/>.
 # ----------------------------------------------------------------------
+import concurrent.futures
 import copy
 import fnmatch
 import glob
@@ -29,6 +30,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import zlib
 from unittest import mock
@@ -750,6 +752,254 @@ class CompressorBhashIntegrationTest(unittest.TestCase):
             proc = run_py(args, input=img[:-10])
             self.assertNotEqual(proc.returncode, 0)
             self.assertEqual(sorted(os.listdir(td)), [])
+
+
+class _RecordingExecutor(concurrent.futures.ThreadPoolExecutor):
+    """ThreadPoolExecutor recording max_workers and the max in-flight window.
+
+    A future counts as in flight from submit() until its result() was taken.
+    """
+
+    instances = []
+
+    def __init__(self, max_workers=None, *args, **kwargs):
+        super().__init__(max_workers, *args, **kwargs)
+        self.max_workers_arg = max_workers
+        self.outstanding = 0
+        self.max_outstanding = 0
+        self.submitted = 0
+        self.worker_thread_names = set()
+        self._rec_lock = threading.Lock()
+        _RecordingExecutor.instances.append(self)
+
+    def submit(self, fn, *args, **kwargs):
+        def _run(*a, **k):
+            self.worker_thread_names.add(threading.current_thread().name)
+            return fn(*a, **k)
+
+        fut = super().submit(_run, *args, **kwargs)
+        with self._rec_lock:
+            self.submitted += 1
+            self.outstanding += 1
+            self.max_outstanding = max(self.max_outstanding, self.outstanding)
+        orig_result = fut.result
+
+        def _result(*a, **k):
+            value = orig_result(*a, **k)
+            with self._rec_lock:
+                self.outstanding -= 1
+            return value
+
+        fut.result = _result
+        return fut
+
+
+class ParallelBhashBuilderTest(unittest.TestCase):
+    """SeekZilla v2.2: parallel `.rzidx` decoding, progress and cancel."""
+
+    FMTS = (("gzip", "gz"), ("zstd", "zst"))
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.td = self._td.name
+        rng = random.Random(2202)
+        self.tb = 2600
+        self.blocks = rand_blocks(
+            rng, [i for i in range(self.tb) if rng.random() < 0.7], 4096, zero_every=5
+        )
+        self.img = build_ptcl(self.blocks, self.tb, 4096, bpcs=64, fs=b"NTFS")
+        self.ref = ref_digests(self.blocks, self.tb, 4096, 65536)
+        _RecordingExecutor.instances = []
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def _make(self, fmt, suffix, sub=None):
+        d = os.path.join(self.td, sub or fmt)
+        os.makedirs(d, exist_ok=True)
+        idx = os.path.join(d, "Info-seekidx-sda1.rzidx")
+        out = io.BytesIO()
+        sc.compress_stream(
+            io.BytesIO(self.img), out, fmt=fmt, level=1, frame_size=65536,
+            index_output=idx, threads=2,
+        )
+        paths = write_splits(os.path.join(d, f"sda1.ntfs-ptcl-img.{suffix}."), out.getvalue(), 250000)
+        self.assertGreater(len(paths), 1)
+        with open(idx, "rb") as f:
+            self.assertGreater(sc.parse_seekidx_bytes(f.read())["frame_count"], 40)
+        return d, paths, idx
+
+    @staticmethod
+    def _read(path):
+        with open(path, "rb") as f:
+            return f.read()
+
+    def test_parallel_rzidx_is_bit_for_bit_identical_and_read_only(self):
+        for fmt, suffix in self.FMTS:
+            with self.subTest(fmt=fmt):
+                d, paths, idx = self._make(fmt, suffix)
+                before = {p: (os.stat(p).st_mtime_ns, self._read(p)) for p in paths}
+                seq_out = os.path.join(d, "seq.rzbhash")
+                par_out = os.path.join(d, "par.rzbhash")
+                seq = bh.build_bhash_from_splits(paths, fmt, seq_out, chunk_size=65536)
+                opened = []
+                real_os_open = os.open
+
+                def _spy_open(path, flags, *a, **k):
+                    opened.append((os.fspath(path), flags))
+                    return real_os_open(path, flags, *a, **k)
+
+                with mock.patch.object(bh, "_build_index_sequential",
+                                       side_effect=AssertionError("fell back to sequential")), \
+                        mock.patch.object(bh.concurrent.futures, "ThreadPoolExecutor", _RecordingExecutor), \
+                        mock.patch.object(bh.os, "open", _spy_open):
+                    par = bh.build_bhash_from_splits(
+                        paths, fmt, par_out, chunk_size=65536, seekidx_path=idx, max_workers=2
+                    )
+                self.assertEqual(self._read(seq_out), self._read(par_out))
+                self.assertEqual(par.digests, self.ref)
+                self.assertEqual(seq.digests, self.ref)
+                ex = _RecordingExecutor.instances[-1]
+                self.assertEqual(ex.max_workers_arg, 2)
+                self.assertLessEqual(ex.max_outstanding, 2 * 2)  # window = max_workers * 2
+                self.assertGreaterEqual(ex.max_outstanding, 2)
+                self.assertTrue(all(n.startswith("rzbhash-decode") for n in ex.worker_thread_names))
+                split_opens = [(p, fl) for p, fl in opened if p in before]
+                self.assertTrue(split_opens)
+                for _p, flags in split_opens:
+                    self.assertEqual(flags & os.O_ACCMODE, os.O_RDONLY)
+                for p, (mtime, data) in before.items():
+                    self.assertEqual(os.stat(p).st_mtime_ns, mtime)
+                    self.assertEqual(self._read(p), data)
+
+    def test_worker_count_is_capped_at_eight(self):
+        self.assertEqual(bh.resolve_parallel_workers(64), 8)
+        self.assertEqual(bh.resolve_parallel_workers(0), 1)
+        self.assertLessEqual(bh.resolve_parallel_workers(None), 8)
+        d, paths, idx = self._make("zstd", "zst")
+        with mock.patch.object(bh.concurrent.futures, "ThreadPoolExecutor", _RecordingExecutor):
+            bh.build_bhash_from_splits(
+                paths, "zstd", os.path.join(d, "o.rzbhash"), chunk_size=65536,
+                seekidx_path=idx, max_workers=64,
+            )
+        ex = _RecordingExecutor.instances[-1]
+        self.assertEqual(ex.max_workers_arg, 8)
+        self.assertLessEqual(ex.max_outstanding, 16)
+
+    def test_mismatched_rzidx_falls_back_to_identical_sequential_output(self):
+        d, paths, _idx = self._make("zstd", "zst")
+        _d2, _p2, gz_idx = self._make("gzip", "gz", sub="other")
+        ref_out = os.path.join(d, "ref.rzbhash")
+        bh.build_bhash_from_splits(paths, "zstd", ref_out, chunk_size=65536)
+        bad_idx = os.path.join(d, "bad.rzidx")
+        with open(bad_idx, "wb") as f:
+            f.write(b"garbage")
+        for wrong in (gz_idx, bad_idx):
+            with self.subTest(idx=os.path.basename(wrong)):
+                out = os.path.join(d, "fb.rzbhash")
+                with mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err:
+                    bh.build_bhash_from_splits(
+                        paths, "zstd", out, chunk_size=65536, seekidx_path=wrong
+                    )
+                self.assertIn("ignoring unusable seek index", err.getvalue())
+                self.assertEqual(self._read(out), self._read(ref_out))
+
+    def test_progress_is_monotonic_and_reaches_total(self):
+        for use_idx in (True, False):
+            for fmt, suffix in self.FMTS:
+                with self.subTest(fmt=fmt, parallel=use_idx):
+                    d, paths, idx = self._make(fmt, suffix, sub=f"{fmt}-{use_idx}")
+                    calls = []
+                    with mock.patch.object(bh, "PROGRESS_MIN_INTERVAL_SECONDS", 0.0):
+                        bh.build_bhash_from_splits(
+                            paths, fmt, os.path.join(d, "p.rzbhash"), chunk_size=65536,
+                            seekidx_path=idx if use_idx else None,
+                            progress_cb=lambda *a: calls.append(a),
+                        )
+                    total = sum(os.path.getsize(p) for p in paths)
+                    # parallel: one report per frame; sequential: one per 4 MiB read
+                    self.assertGreaterEqual(len(calls), 10 if use_idx else 2)
+                    dones = [c[0] for c in calls]
+                    self.assertEqual(dones, sorted(dones))
+                    self.assertTrue(all(c[1] == total for c in calls))
+                    self.assertEqual(calls[-1][0], total)
+                    self.assertEqual(calls[-1][2], len(self.img))
+                    decomp = [c[2] for c in calls]
+                    self.assertEqual(decomp, sorted(decomp))
+
+    def test_cancel_raises_and_leaves_no_output_or_temp_files(self):
+        for use_idx in (True, False):
+            for fmt, suffix in self.FMTS:
+                with self.subTest(fmt=fmt, parallel=use_idx):
+                    d, paths, idx = self._make(fmt, suffix, sub=f"c-{fmt}-{use_idx}")
+                    before = sorted(os.listdir(d))
+                    out = os.path.join(d, bh.bhash_index_filename("sda1"))
+                    ev = threading.Event()
+                    calls = []
+
+                    def _cb(*a):
+                        calls.append(a)
+                        ev.set()  # cancel after the first progress report
+
+                    with mock.patch.object(bh, "PROGRESS_MIN_INTERVAL_SECONDS", 0.0):
+                        with self.assertRaises(bh.BhashBuildCancelledError):
+                            bh.build_bhash_from_splits(
+                                paths, fmt, out, chunk_size=65536,
+                                seekidx_path=idx if use_idx else None,
+                                progress_cb=_cb, cancel_event=ev,
+                            )
+                    self.assertTrue(calls)
+                    self.assertLess(calls[-1][0], sum(os.path.getsize(p) for p in paths))
+                    self.assertEqual(sorted(os.listdir(d)), before)
+                    self.assertFalse(os.path.exists(out))
+        # Already-set event: nothing is even read.
+        ev = threading.Event()
+        ev.set()
+        with self.assertRaises(bh.BhashBuildCancelledError):
+            bh.build_bhash_from_splits(paths, "zstd", out, cancel_event=ev)
+        self.assertFalse(issubclass(bh.BhashBuildCancelledError, ValueError))
+
+    def test_build_from_stream_accepts_progress_and_cancel(self):
+        calls = []
+        idx = bh.build_bhash_from_stream(
+            io.BytesIO(self.img), 65536, read_size=100000, progress_cb=lambda *a: calls.append(a)
+        )
+        self.assertEqual(idx.digests, self.ref)
+        self.assertEqual(calls[-1], (len(self.img), None, len(self.img)))
+        ev = threading.Event()
+        ev.set()
+        with self.assertRaises(bh.BhashBuildCancelledError):
+            bh.build_bhash_from_stream(io.BytesIO(self.img), 65536, cancel_event=ev)
+
+    def test_inspect_base_dir_bhash_status(self):
+        d, paths, idx = self._make("zstd", "zst", sub="base")
+        write_splits(os.path.join(d, "sda2.dd-ptcl-img.zst."), b"x" * 100, 1000)
+        write_splits(os.path.join(d, "sda3.ext4-ptcl-img.gz."), b"y" * 300, 1000)
+        with open(os.path.join(d, bh.bhash_index_filename("sda3")), "wb") as f:
+            f.write(b"RZBHASH1 truncated")
+        st = bh.inspect_base_dir_bhash_status(d)
+        self.assertEqual(st["ptcl_parts"], ["sda1", "sda3"])  # dd never listed
+        self.assertEqual(st["bhash_parts"], [])
+        self.assertEqual(st["missing_bhash_parts"], ["sda1", "sda3"])
+        self.assertEqual(st["invalid_bhash_parts"], ["sda3"])
+        self.assertEqual([i.short_part for i in st["missing_images"]], ["sda1", "sda3"])
+        self.assertEqual(st["total_missing_compressed_bytes"], sum(os.path.getsize(p) for p in paths) + 300)
+        self.assertTrue(st["needs_bhash"])
+        self.assertFalse(st["ready"])
+        bh.build_bhash_from_splits(paths, "zstd", os.path.join(d, bh.bhash_index_filename("sda1")),
+                                   seekidx_path=idx)
+        os.remove(os.path.join(d, bh.bhash_index_filename("sda3")))
+        os.remove(os.path.join(d, "sda3.ext4-ptcl-img.gz.aa"))
+        st = bh.inspect_base_dir_bhash_status(d)
+        self.assertEqual(st["bhash_parts"], ["sda1"])
+        self.assertTrue(st["ready"])
+        self.assertFalse(st["needs_bhash"])
+        self.assertTrue(bh.is_bhash_file_valid(os.path.join(d, bh.bhash_index_filename("sda1")), True))
+        open(os.path.join(d, "Info-rzdiff-manifest.json"), "w").close()
+        st = bh.inspect_base_dir_bhash_status(d)
+        self.assertTrue(st["is_differential"])
+        self.assertEqual(st["ptcl_parts"], [])
+        self.assertEqual(bh.inspect_base_dir_bhash_status(os.path.join(d, "nope"))["ptcl_parts"], [])
 
 
 # ----------------------------------------------------------------------
@@ -1661,6 +1911,38 @@ class ImportCompatTest(unittest.TestCase):
                 )
                 with self.assertRaises(df.DiffFormatError):
                     meta.payload_bytes()
+
+    def test_l4_l5_atomic_write_symlink_safe_and_split_escape_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            out_dir = os.path.join(td, "base")
+            os.makedirs(out_dir)
+            outside = os.path.join(td, "outside.txt")
+            with open(outside, "wb") as fh:
+                fh.write(b"UNTOUCHED")
+            target = os.path.join(out_dir, "Info-bhash-sda1.rzbhash")
+            # Even if an attacker pre-creates the old predictable `.tmp.<pid>` symlink,
+            # atomic_write_bytes uses mkstemp (O_CREAT|O_EXCL random suffix) and never writes to it.
+            predictable_tmp = f"{target}.tmp.{os.getpid()}"
+            os.symlink(outside, predictable_tmp)
+            bh.atomic_write_bytes(target, b"SAFE-PAYLOAD")
+            with open(target, "rb") as fh:
+                self.assertEqual(fh.read(), b"SAFE-PAYLOAD")
+            with open(outside, "rb") as fh:
+                self.assertEqual(fh.read(), b"UNTOUCHED")
+            # L5: split path symlink escaping the backup folder is rejected
+            bad_split = os.path.join(out_dir, "sda1.ntfs-ptcl-img.zst.aa")
+            os.symlink(outside, bad_split)
+            with self.assertRaises(ValueError):
+                bh.build_bhash_from_splits(
+                    [bad_split], "zstd", os.path.join(out_dir, "Info-bhash-escape.rzbhash")
+                )
+            if hasattr(os, "mkfifo"):
+                fifo = os.path.join(out_dir, "sda2.ntfs-ptcl-img.zst.aa")
+                os.mkfifo(fifo)
+                with self.assertRaises(ValueError):
+                    bh.build_bhash_from_splits(
+                        [fifo], "zstd", os.path.join(out_dir, "Info-bhash-fifo.rzbhash")
+                    )
 
 
 if __name__ == "__main__":

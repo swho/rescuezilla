@@ -18,6 +18,7 @@
 #   along with this program.  If not, see <http://www.gnu.org/licenses/>.
 # ----------------------------------------------------------------------
 import ast
+import collections
 import hashlib
 import io
 import json
@@ -38,6 +39,7 @@ import backup_manager
 import block_hash as bh
 import diff_format as df
 import diff_synthesizer as ds
+import seekable_compressor as sc
 from backup_manager import BackupManager, check_diff_eligibility
 from utility import Utility
 
@@ -866,18 +868,19 @@ class RestoreVerifyRzdiffTest(_DiffFixtureMixin, unittest.TestCase):
 # ----------------------------------------------------------------------
 
 
-def load_discover_compatible_base_images():
+def load_handler_function(name):
+    """A top-level handler.py function exec'd on its own (must be self-contained)."""
     path = os.path.join(PKG_DIR, "handler.py")
     with open(path, encoding="utf-8") as fh:
         tree = ast.parse(fh.read())
-    fn = next(
-        n
-        for n in tree.body
-        if isinstance(n, ast.FunctionDef) and n.name == "discover_compatible_base_images"
-    )
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
     ns = {}
     exec(compile(ast.Module(body=[fn], type_ignores=[]), path, "exec"), ns)
-    return ns["discover_compatible_base_images"]
+    return ns[name]
+
+
+def load_discover_compatible_base_images():
+    return load_handler_function("discover_compatible_base_images")
 
 
 class DiscoverBaseImagesTest(unittest.TestCase):
@@ -960,10 +963,863 @@ class DiscoverBaseImagesTest(unittest.TestCase):
         self.assertIn('SEEKZILLA_FULL_FOLDER_SUFFIX = "-img-seekzilla"', src)
         self.assertIn('SEEKZILLA_DIFF_FOLDER_SUFFIX = "-diff-seekzilla"', src)
         self.assertNotIn('"-img-rescuezilla"', src)
-        self.assertIn('get_object("backup_step7_content_vbox2")', src)
+        # v2.2: the Backup Mode frame lives on Step 4; Step 6 only gets a warning label
+        self.assertIn('_get_builder_object("backup_step4_contentvbox")', src)
+        self.assertIn('_get_builder_object("backup_step7_content_vbox2")', src)
+        self.assertNotIn('Gtk.Frame(label=_("Differential Backup (Optional)"))', src)
         self.assertIn("diff_base_dirs_by_drive=diff_base_dirs_by_drive", src)
         self.assertIn("diff_base_dir=diff_base_dir", src)
         self.assertIn("self.refresh_differential_base_images()", src)
+        self.assertIn("set_on_scan_complete_callback", src)
+        self.assertIn("threading.Thread(", src)
+        self.assertIn("GLib.idle_add(self._bhash_build_progress_ui", src)
+        self.assertIn("GLib.idle_add(self._on_bhash_build_finished", src)
+        with open(os.path.join(PKG_DIR, "image_folder_query.py"), encoding="utf-8") as fh:
+            ifq = fh.read()
+        self.assertIn("def set_on_scan_complete_callback(self, callback):", ifq)
+        populate = ifq[ifq.index("def _populate_image_list_table"):ifq.index("def scan_file")]
+        self.assertLess(
+            populate.index("self.please_wait_popup.destroy()"),
+            populate.index("callback()"),
+        )
+
+
+# ----------------------------------------------------------------------
+# 6. SeekZilla v2.2: Needs-.rzbhash discovery + per-partition preview
+# ----------------------------------------------------------------------
+
+
+def _write_valid_bhash(path, fs=b"ntfs"):
+    bh.write_bhash_file(
+        path,
+        bh.BlockHashIndex(
+            chunk_size=1048576, block_size=4096, totalblock=256, device_size=256 * 4096,
+            num_chunks=1, fs_name=fs, digests=b"\x11" * 32,
+        ),
+    )
+
+
+def _blkdev_list_text(kname, size, model):
+    head = "{:<10} {:<12} {:>7} {:<4} {:<6} {:<10} {}".format(
+        "KNAME", "NAME", "SIZE", "TYPE", "FSTYPE", "MOUNTPOINT", "MODEL"
+    )
+    row = "{:<10} {:<12} {:>7} {:<4} {:<6} {:<10} {}".format(kname, kname, size, "disk", "", "", model)
+    part = "{:<10} {:<12} {:>7} {:<4} {:<6}".format(kname + "p1", "`-" + kname + "p1", "512M", "part", "vfat")
+    return head + "\n" + row + "\n" + part + "\n"
+
+
+class NeedsBhashDiscoveryTest(unittest.TestCase):
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.parent = self._td.name
+        self.discover = load_discover_compatible_base_images()
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def _mk(self, name, disk=None, parts=(), indexed=(), fs="ntfs", comp="zst", mtime=None,
+            corrupt=(), diff=False, blkdev=None, dd_parts=()):
+        d = os.path.join(self.parent, name)
+        os.makedirs(d)
+        if disk is not None:
+            with open(os.path.join(d, "disk"), "w", encoding="utf-8") as fh:
+                fh.write(disk + "\n")
+        for part in parts:
+            with open(os.path.join(d, f"{part}.{fs}-ptcl-img.{comp}.aa"), "wb") as fh:
+                fh.write(b"z" * 1000)
+            with open(os.path.join(d, f"{part}.{fs}-ptcl-img.{comp}.ab"), "wb") as fh:
+                fh.write(b"z" * 234)
+        for part in dd_parts:
+            with open(os.path.join(d, f"{part}.dd-ptcl-img.{comp}.aa"), "wb") as fh:
+                fh.write(b"d" * 10)
+        for part in indexed:
+            _write_valid_bhash(os.path.join(d, bh.bhash_index_filename(part)))
+        for part in corrupt:
+            open(os.path.join(d, bh.bhash_index_filename(part)), "wb").close()
+        if diff:
+            open(os.path.join(d, "sda1.ntfs-rzdiff.meta"), "w").close()
+        if blkdev is not None:
+            with open(os.path.join(d, "blkdev.list"), "w", encoding="utf-8") as fh:
+                fh.write(blkdev)
+        if mtime is not None:
+            os.utime(d, (mtime, mtime))
+        return d
+
+    def test_ready_and_needs_bhash_single_drive(self):
+        ready = self._mk("2026-11-01-0900-img-seekzilla", "sda", ["sda1", "sda2"], ["sda1", "sda2"], mtime=1000)
+        legacy = self._mk("2026-11-20-0900-img-rescuezilla", "sda", ["sda1", "sda2"], [], mtime=3000)
+        partial = self._mk("2026-11-10-0900-img-seekzilla", "sda", ["sda1", "sda2"], ["sda1"], mtime=2000)
+        corrupt = self._mk("2026-11-05-0900-img-seekzilla", "sda", ["sda1"], [], corrupt=["sda1"], mtime=1500)
+        self._mk("2026-11-28-1000-diff-seekzilla", "sda", ["sda1"], ["sda1"], diff=True, mtime=9000)
+        self._mk("2026-11-27-1000-dd-only", "sda", [], [], dd_parts=["sda1"], mtime=8000)
+        state = {"/dev/sda": {"partitions": {"/dev/sda1": {}, "/dev/sda2": {}}}}
+
+        # Default mode: exact legacy behaviour (only folders with .rzbhash files, newest first).
+        legacy_found = self.discover(self.parent, ["/dev/sda"], state)
+        self.assertEqual([c["base_dir"] for c in legacy_found], [partial, corrupt, ready])
+        self.assertEqual([c["label"] for c in legacy_found], [os.path.basename(c["base_dir"]) for c in legacy_found])
+        self.assertNotIn("ready", legacy_found[0])
+
+        found = self.discover(self.parent, ["/dev/sda"], state, include_needs_bhash=True)
+        self.assertEqual([c["base_dir"] for c in found], [ready, legacy, partial, corrupt])
+        by_dir = {c["base_dir"]: c for c in found}
+        self.assertEqual(by_dir[ready]["label"], "2026-11-01-0900-img-seekzilla  [Ready]")
+        self.assertTrue(by_dir[ready]["ready"])
+        self.assertFalse(by_dir[ready]["needs_bhash"])
+        self.assertTrue(by_dir[ready]["fully_indexed"])
+        self.assertEqual(by_dir[legacy]["label"], "2026-11-20-0900-img-rescuezilla  [Needs .rzbhash index]")
+        self.assertFalse(by_dir[legacy]["has_any_bhash"])
+        self.assertEqual(by_dir[legacy]["missing_bhash_count"], 2)
+        self.assertEqual(by_dir[legacy]["missing_bhash_bytes"], 2 * 1234)
+        (base_dir, images), = by_dir[legacy]["missing_bhash_by_drive"]["/dev/sda"]
+        self.assertEqual(base_dir, legacy)
+        self.assertEqual([i.short_part for i in images], ["sda1", "sda2"])
+        self.assertEqual(len(images[0].split_paths), 2)
+        self.assertTrue(by_dir[partial]["has_any_bhash"])
+        self.assertTrue(by_dir[partial]["needs_bhash"])
+        self.assertFalse(by_dir[partial]["ready"])
+        self.assertEqual(by_dir[partial]["missing_bhash_count"], 1)
+        self.assertTrue(by_dir[corrupt]["needs_bhash"])  # empty .rzbhash counts as missing
+        self.assertFalse(by_dir[corrupt]["has_any_bhash"])
+        for cand in found:
+            self.assertNotIn("diff", os.path.basename(cand["base_dir"]))
+            self.assertNotIn("dd-only", os.path.basename(cand["base_dir"]))
+
+    def test_multi_drive_ready_and_needs_groups(self):
+        keys = ["/dev/nvme0n1", "/dev/nvme1n1"]
+        r0 = self._mk("2026-11-01-0800-img-seekzilla-nvme0n1", "nvme0n1", ["nvme0n1p1"], ["nvme0n1p1"], mtime=1000)
+        r1 = self._mk("2026-11-01-0800-img-seekzilla-nvme1n1", "nvme1n1", ["nvme1n1p1"], ["nvme1n1p1"], mtime=1000)
+        n0 = self._mk("2026-11-25-0800-img-rescuezilla-nvme0n1", "nvme0n1", ["nvme0n1p1"], [], mtime=5000)
+        n1 = self._mk("2026-11-25-0800-img-rescuezilla-nvme1n1", "nvme1n1", ["nvme1n1p1", "nvme1n1p2"], [], mtime=5000)
+        self._mk("2026-11-26-0800-diff-seekzilla-nvme0n1", "nvme0n1", ["nvme0n1p1"], ["nvme0n1p1"], diff=True)
+        found = self.discover(self.parent, keys, {}, include_needs_bhash=True)
+        self.assertEqual(
+            [c["label"] for c in found],
+            [
+                "2026-11-01-0800-img-seekzilla  (2/2 drives · Ready)",
+                "2026-11-25-0800-img-rescuezilla  (2/2 drives · Needs .rzbhash index)",
+            ],
+        )
+        self.assertEqual(found[0]["base_dirs_by_drive"], {keys[0]: r0, keys[1]: r1})
+        needs = found[1]
+        self.assertEqual(needs["base_dirs_by_drive"], {keys[0]: n0, keys[1]: n1})
+        self.assertEqual(sorted(needs["missing_bhash_by_drive"]), keys)
+        self.assertEqual(needs["missing_bhash_count"], 3)
+        self.assertEqual(needs["missing_bhash_by_drive"][keys[1]][0][0], n1)
+        # default mode: the unindexed group is not offered, label format unchanged
+        legacy = self.discover(self.parent, keys, {})
+        self.assertEqual([c["label"] for c in legacy], ["2026-11-01-0800-img-seekzilla (2/2 drives)"])
+
+    def test_blkdev_list_model_and_size_match_when_device_names_drift(self):
+        model = "Samsung SSD 980 PRO 1TB"
+        cap = 1000204886016  # lsblk: 931.5G
+        base = self._mk(
+            "2026-11-20-0900-img-rescuezilla", "nvme1n1", ["nvme1n1p1", "nvme1n1p2"], ["nvme1n1p1"],
+            blkdev=_blkdev_list_text("nvme1n1", "931.5G", model), mtime=1000,
+        )
+        state = {
+            "/dev/nvme0n1": {"model": model, "capacity": cap, "partitions": {"/dev/nvme0n1p1": {}}},
+            "/dev/sda": {"model": "Other Disk", "capacity": 500107862016, "partitions": {}},
+        }
+        self.assertEqual(self.discover(self.parent, ["/dev/nvme0n1"], state), [])  # default: no drift matching
+        found = self.discover(self.parent, ["/dev/nvme0n1"], state, include_needs_bhash=True)
+        self.assertEqual([c["base_dir"] for c in found], [base])
+        self.assertTrue(found[0]["device_name_drifted"])
+        self.assertTrue(found[0]["all_drifted"])
+        self.assertFalse(found[0]["ready"])
+        self.assertFalse(found[0]["needs_bhash"])
+        self.assertEqual(found[0]["missing_bhash_by_drive"], {})
+        self.assertIn("Device name changed: nvme1n1 -> nvme0n1", found[0]["label"])
+        self.assertEqual(found[0]["drifted_drives"], {"/dev/nvme0n1": "nvme1n1"})
+        # multi-drive: the drifted folder still joins a group for the right drive, not marked ready
+        state["/dev/sda"]["partitions"] = {"/dev/sda1": {}}
+        multi = self.discover(self.parent, ["/dev/nvme0n1", "/dev/sda"], state, include_needs_bhash=True)
+        self.assertEqual(multi[0]["base_dirs_by_drive"], {"/dev/nvme0n1": base})
+        self.assertEqual(multi[0]["missing_drives"], ["/dev/sda"])
+        self.assertTrue(multi[0]["device_name_drifted"])
+        self.assertTrue(multi[0]["all_drifted"])
+        self.assertFalse(multi[0]["ready"])
+        self.assertFalse(multi[0]["needs_bhash"])
+        # nvme0n1 <-> nvme1n1 swap: blkdev.list model+size vetoes wrong suffix match
+        other_model = "WD_BLACK SN850X 2000GB"
+        other_cap = 2000398934016  # lsblk: 1.8T
+        swap_base_0 = self._mk(
+            "2026-11-22-0900-img-seekzilla-nvme0n1", "nvme0n1", ["nvme0n1p1"], ["nvme0n1p1"],
+            blkdev=_blkdev_list_text("nvme0n1", "1.8T", other_model), mtime=2000,
+        )
+        swap_base_1 = self._mk(
+            "2026-11-22-0900-img-seekzilla-nvme1n1", "nvme1n1", ["nvme1n1p1"], ["nvme1n1p1"],
+            blkdev=_blkdev_list_text("nvme1n1", "931.5G", model), mtime=2000,
+        )
+        swapped_state = {
+            "/dev/nvme0n1": {"model": model, "capacity": cap, "partitions": {"/dev/nvme0n1p1": {}}},
+            "/dev/nvme1n1": {"model": other_model, "capacity": other_cap, "partitions": {"/dev/nvme1n1p1": {}}},
+        }
+        swapped = self.discover(
+            self.parent, ["/dev/nvme0n1", "/dev/nvme1n1"], swapped_state, include_needs_bhash=True
+        )
+        swap_group = next(c for c in swapped if swap_base_0 in c["base_dirs_by_drive"].values())
+        self.assertEqual(
+            swap_group["base_dirs_by_drive"],
+            {"/dev/nvme0n1": swap_base_1, "/dev/nvme1n1": swap_base_0},
+        )
+        self.assertTrue(swap_group["all_drifted"])
+        self.assertFalse(swap_group["ready"])
+        # ambiguous: two identical drives -> never guess
+        state["/dev/nvme2n1"] = {"model": model, "capacity": cap, "partitions": {}}
+        self.assertEqual(self.discover(self.parent, ["/dev/nvme0n1"], state, include_needs_bhash=True), [])
+        # size mismatch -> no match
+        del state["/dev/nvme2n1"]
+        state["/dev/nvme0n1"]["capacity"] = 2 * cap
+        self.assertEqual(self.discover(self.parent, ["/dev/nvme0n1"], state, include_needs_bhash=True), [])
+
+
+class DifferentialPartitionPreviewTest(unittest.TestCase):
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.preview = load_handler_function("build_differential_partition_preview")
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def _base(self, name, parts, indexed, fs="ntfs"):
+        d = os.path.join(self._td.name, name)
+        os.makedirs(d)
+        for p in parts:
+            open(os.path.join(d, f"{p}.{fs}-ptcl-img.zst.aa"), "wb").close()
+        for p in indexed:
+            open(os.path.join(d, bh.bhash_index_filename(p)), "wb").close()
+        return d
+
+    @staticmethod
+    def _parts(*names, fs="ntfs"):
+        return collections.OrderedDict(("/dev/" + n, {"filesystem": fs}) for n in names)
+
+    def _modes(self, result, dk):
+        drive = next(d for d in result["drives"] if d["drive"] == dk)
+        return {p["short_part"]: (p["mode"], p["reason"]) for p in drive["partitions"]}
+
+    def test_base_has_3_user_selects_4(self):
+        base = self._base("b", ["sda1", "sda2", "sda3"], ["sda1", "sda2", "sda3"])
+        res = self.preview(["/dev/sda"], {"/dev/sda": self._parts("sda1", "sda2", "sda3", "sda4")},
+                           {"base_dirs_by_drive": {"/dev/sda": base}})
+        self.assertEqual((res["diff_count"], res["full_count"], res["pending_bhash_count"]), (3, 1, 0))
+        modes = self._modes(res, "/dev/sda")
+        self.assertEqual(modes["sda4"][0], "full")
+        self.assertIn("not in base", modes["sda4"][1])
+        self.assertEqual(res["omitted_base_parts"], {"/dev/sda": []})
+        self.assertIn("sda4", res["summary_text"])
+        self.assertIn("3 differential", res["summary_text"])
+
+    def test_base_has_4_user_selects_3(self):
+        base = self._base("b", ["sda1", "sda2", "sda3", "sda4"], ["sda1", "sda2", "sda3", "sda4"])
+        res = self.preview(["/dev/sda"], {"/dev/sda": self._parts("sda1", "sda2", "sda3")},
+                           {"base_dirs_by_drive": {"/dev/sda": base}})
+        self.assertEqual((res["diff_count"], res["full_count"]), (3, 0))
+        self.assertEqual(res["omitted_base_parts"], {"/dev/sda": ["sda4"]})
+        self.assertIn("not selected", res["summary_text"])
+        self.assertIn("sda4", res["summary_text"])
+
+    def test_dd_partition_is_full(self):
+        base = self._base("b", ["sda1", "sda2"], ["sda1", "sda2"])
+        parts = self._parts("sda1")
+        parts["/dev/sda2"] = {"filesystem": ""}  # no partclone filesystem -> partclone.dd
+        res = self.preview(["/dev/sda"], {"/dev/sda": parts}, {"base_dirs_by_drive": {"/dev/sda": base}})
+        modes = self._modes(res, "/dev/sda")
+        self.assertEqual(modes["sda1"][0], "diff")
+        self.assertEqual(modes["sda2"][0], "full")
+        self.assertIn("partclone.dd", modes["sda2"][1])
+
+    def test_filesystem_changed_and_drifted_drive_preview_as_full(self):
+        base = self._base("b", ["sda1", "sda2"], ["sda1", "sda2"], fs="ext4")
+        parts = collections.OrderedDict(
+            [("/dev/sda1", {"filesystem": "ext4"}), ("/dev/sda2", {"filesystem": "btrfs"})]
+        )
+        res = self.preview(["/dev/sda"], {"/dev/sda": parts}, {"base_dirs_by_drive": {"/dev/sda": base}})
+        modes = self._modes(res, "/dev/sda")
+        self.assertEqual(modes["sda1"][0], "diff")
+        self.assertEqual(modes["sda2"][0], "full")
+        self.assertIn("filesystem changed", modes["sda2"][1])
+        # Drifted drive must preview every partition as full, never diff/pending
+        drifted_res = self.preview(
+            ["/dev/sda"],
+            {"/dev/sda": parts},
+            {"base_dirs_by_drive": {"/dev/sda": base}, "drifted_drives": {"/dev/sda": "sdb"}},
+        )
+        self.assertEqual((drifted_res["diff_count"], drifted_res["full_count"], drifted_res["pending_bhash_count"]), (0, 2, 0))
+        dmodes = self._modes(drifted_res, "/dev/sda")
+        self.assertIn("drive name changed", dmodes["sda1"][1])
+
+    def test_unindexed_base_is_pending_bhash(self):
+        base = self._base("b", ["sda1", "sda2"], [])
+        res = self.preview(["/dev/sda"], {"/dev/sda": self._parts("sda1", "sda2")},
+                           {"base_dirs_by_drive": {"/dev/sda": base}})
+        self.assertEqual(res["pending_bhash_count"], 2)
+        self.assertEqual(self._modes(res, "/dev/sda")["sda1"][0], "pending_bhash")
+        self.assertIn("Build Base Index", res["summary_text"])
+
+    def test_multi_drive_with_one_drive_missing(self):
+        base = self._base("b-nvme0n1", ["nvme0n1p1"], ["nvme0n1p1"])
+        keys = ["/dev/nvme0n1", "/dev/nvme1n1"]
+        res = self.preview(
+            keys,
+            {keys[0]: self._parts("nvme0n1p1"), keys[1]: self._parts("nvme1n1p1")},
+            {"base_dirs_by_drive": {keys[0]: base}, "missing_drives": [keys[1]]},
+        )
+        self.assertEqual(self._modes(res, keys[0])["nvme0n1p1"][0], "diff")
+        mode, reason = self._modes(res, keys[1])["nvme1n1p1"]
+        self.assertEqual(mode, "full")
+        self.assertIn("no compatible base", reason)
+        self.assertEqual((res["diff_count"], res["full_count"]), (1, 1))
+
+    def test_no_candidate_means_all_full(self):
+        res = self.preview(["/dev/sda"], {"/dev/sda": self._parts("sda1")}, None)
+        self.assertEqual((res["diff_count"], res["full_count"]), (0, 1))
+
+
+# ----------------------------------------------------------------------
+# 7. SeekZilla v2.2: Step 4 Handler workflow with fake (headless) GTK
+# ----------------------------------------------------------------------
+
+
+class _FakeWidget:
+    def __init__(self, *args, **kwargs):
+        self.kwargs = kwargs
+        self.children = []
+        self.parent = None
+        self.visible = False
+        self.no_show_all = False
+        self.sensitive = True
+        self.text = kwargs.get("label", "")
+        self.markup = None
+        self.handlers = collections.defaultdict(list)
+        self.padding = (0, 20)
+        self.destroyed = False
+
+    def __getattr__(self, name):
+        if name.startswith(("set_", "add_mark", "clear_")):
+            return lambda *a, **k: None
+        raise AttributeError(name)
+
+    def connect(self, signal, cb, *extra):
+        self.handlers[signal].append((cb, extra))
+
+    def emit(self, signal, *args):
+        result = None
+        for cb, extra in list(self.handlers[signal]):
+            result = cb(self, *(args + extra))
+        return result
+
+    # containers
+    def pack_start(self, child, *_a):
+        self.children.append(child)
+        child.parent = self
+
+    def add(self, child):
+        self.pack_start(child)
+
+    def get_children(self):
+        return list(self.children)
+
+    def reorder_child(self, child, pos):
+        self.children.remove(child)
+        self.children.insert(pos, child)
+
+    def get_parent(self):
+        return self.parent
+
+    def get_child(self):
+        return None
+
+    def get_content_area(self):
+        content = self.__dict__.get("_content")
+        if content is None:
+            content = self.__dict__["_content"] = _FakeWidget()
+            self.pack_start(content)
+        return content
+
+    # visibility
+    def set_no_show_all(self, value):
+        self.no_show_all = bool(value)
+
+    def set_visible(self, value):
+        self.visible = bool(value)
+
+    def get_visible(self):
+        return self.visible
+
+    def show(self):
+        self.visible = True
+
+    def hide(self):
+        self.visible = False
+
+    def show_all(self):
+        if self.no_show_all:
+            return
+        self.visible = True
+        for child in self.children:
+            child.show_all()
+
+    def set_sensitive(self, value):
+        self.sensitive = bool(value)
+
+    def get_sensitive(self):
+        return self.sensitive
+
+    def destroy(self):
+        self.destroyed = True
+
+    # labels / entries
+    def set_text(self, text):
+        self.text = text
+
+    def get_text(self):
+        return self.text
+
+    def set_markup(self, markup):
+        self.markup = markup
+        self.text = markup
+
+    def get_padding(self):
+        return self.padding
+
+    def set_padding(self, x, y):
+        self.padding = (x, y)
+
+    def get_cells(self):
+        return []
+
+    def add_button(self, *_a):
+        button = _FakeWidget()
+        self.pack_start(button)
+        return button
+
+
+class _FakeRadio(_FakeWidget):
+    def __init__(self, group_member, label):
+        super().__init__(label=label)
+        self.group = group_member.group if group_member is not None else []
+        self.group.append(self)
+        self.active = group_member is None
+
+    @classmethod
+    def new_with_label_from_widget(cls, group_member, label):
+        return cls(group_member, label)
+
+    def get_active(self):
+        return self.active
+
+    def set_active(self, value):
+        if not value or self.active:
+            return  # GTK: a radio button cannot be de-activated directly
+        changed = [r for r in self.group if r.active]
+        for r in changed:
+            r.active = False
+        self.active = True
+        for r in changed + [self]:
+            r.emit("toggled")
+
+
+class _FakeCombo(_FakeWidget):
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.items = []
+        self.active = -1
+
+    def append_text(self, text):
+        self.items.append(text)
+
+    def remove_all(self):
+        self.items = []
+        if self.active != -1:
+            self.active = -1
+            self.emit("changed")
+
+    def set_active(self, i):
+        if i != self.active:
+            self.active = i
+            self.emit("changed")
+
+    def get_active(self):
+        return self.active
+
+
+class _FakeCompressionCombo(_FakeWidget):
+    def __init__(self, fmt):
+        super().__init__()
+        self.fmt = fmt
+
+    def get_active_iter(self):
+        return "it"
+
+    def get_model(self):
+        return {"it": [self.fmt]}
+
+
+class _FakeMessageDialog(_FakeWidget):
+    response = None
+    instances = []
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.secondary = ""
+        _FakeMessageDialog.instances.append(self)
+
+    def format_secondary_text(self, text):
+        self.secondary = text
+
+    def run(self):
+        return _FakeMessageDialog.response
+
+
+def _make_fake_gtk():
+    enum = types.SimpleNamespace
+    return types.SimpleNamespace(
+        Frame=_FakeWidget, Box=_FakeWidget, Label=_FakeWidget, Button=_FakeWidget,
+        Viewport=_FakeWidget, ScrolledWindow=_FakeWidget, ProgressBar=_FakeWidget,
+        Dialog=_FakeWidget, ComboBoxText=_FakeCombo, RadioButton=_FakeRadio,
+        MessageDialog=_FakeMessageDialog,
+        Orientation=enum(VERTICAL="V", HORIZONTAL="H"),
+        PolicyType=enum(AUTOMATIC="auto", NEVER="never"),
+        ShadowType=enum(IN="in", NONE="none"),
+        MessageType=enum(QUESTION="q"),
+        ButtonsType=enum(OK_CANCEL="okc"),
+        ResponseType=enum(OK=-5, CANCEL=-6),
+        STOCK_CANCEL="gtk-cancel",
+    )
+
+
+class _DeferredThread:
+    """threading.Thread stand-in: start() only records; the test calls run()."""
+
+    instances = []
+
+    def __init__(self, target=None, args=(), kwargs=None, name=None, daemon=None):
+        self._target, self._args, self._kwargs = target, args, kwargs or {}
+        self.name = name
+        self.daemon = daemon
+        self.started = False
+        _DeferredThread.instances.append(self)
+
+    def start(self):
+        self.started = True
+
+    def run(self):
+        self._target(*self._args, **self._kwargs)
+
+
+def load_handler_class(extra_ns):
+    """handler.Handler (+ module-level helpers) exec'd against fake GTK globals."""
+    path = os.path.join(PKG_DIR, "handler.py")
+    with open(path, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    body = []
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) or (
+            isinstance(node, ast.ClassDef) and node.name == "Handler"
+        ):
+            body.append(node)
+        elif isinstance(node, ast.Assign) and all(
+            isinstance(t, ast.Name) and t.id.startswith("SEEKZILLA_") for t in node.targets
+        ):
+            body.append(node)
+    import datetime as _dt
+    import time as _time
+    import traceback as _traceback
+    import wizard_state
+
+    ns = {
+        "os": os, "collections": collections, "time": _time, "traceback": _traceback,
+        "datetime": _dt.datetime, "block_hash": bh, "Utility": Utility,
+        "Mode": wizard_state.Mode, "Page": wizard_state.Page, "_": lambda s: s,
+        "compute_backup_dest_dirs": backup_manager.compute_backup_dest_dirs,
+    }
+    ns.update(extra_ns)
+    exec(compile(ast.Module(body=body, type_ignores=[]), path, "exec"), ns)
+    return ns["Handler"], ns
+
+
+class Step4HandlerWorkflowTest(unittest.TestCase):
+    PART = "sda1"
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.parent = os.path.join(self._td.name, "dest")
+        os.makedirs(self.parent)
+        self.errors = []
+        self.idle = []
+        _DeferredThread.instances = []
+        _FakeMessageDialog.instances = []
+        _FakeMessageDialog.response = -5  # OK
+        test = self
+
+        class _Error:
+            def __init__(self, builder, message, error_heading=""):
+                test.errors.append(message)
+
+        self.gtk = _make_fake_gtk()
+        self.Handler, self.ns = load_handler_class(
+            {
+                "Gtk": self.gtk,
+                "GObject": types.SimpleNamespace(markup_escape_text=lambda s: s),
+                "GLib": types.SimpleNamespace(
+                    idle_add=lambda fn, *args: self.idle.append((fn, args))
+                ),
+                "Pango": types.SimpleNamespace(
+                    EllipsizeMode=types.SimpleNamespace(END="end", MIDDLE="middle"),
+                    WrapMode=types.SimpleNamespace(WORD_CHAR="wc"),
+                ),
+                "threading": types.SimpleNamespace(Event=threading.Event, Thread=_DeferredThread),
+                "ErrorMessageModalPopup": _Error,
+            }
+        )
+        # Unindexed full base (official Rescuezilla style): zstd splits + .rzidx, no .rzbhash
+        self.base = os.path.join(self.parent, "2026-11-20-0900-img-rescuezilla")
+        os.makedirs(self.base)
+        rng = random.Random(404)
+        blocks = {b: rng.randbytes(BS) for b in range(TB) if rng.random() < 0.5}
+        self.img = build_ptcl(blocks, TB)
+        out = io.BytesIO()
+        self.rzidx = os.path.join(self.base, f"Info-seekidx-{self.PART}.rzidx")
+        sc.compress_stream(io.BytesIO(self.img), out, fmt="zstd", level=1, frame_size=65536,
+                           index_output=self.rzidx, threads=2)
+        data = out.getvalue()
+        self.splits = []
+        split_size = max(1, len(data) // 3 + 1)  # always 3 split files (.aa .ab .ac)
+        for i, off in enumerate(range(0, len(data), split_size)):
+            p = os.path.join(self.base, f"{self.PART}.ntfs-ptcl-img.zst.a" + "abc"[i])
+            with open(p, "wb") as fh:
+                fh.write(data[off:off + split_size])
+            self.splits.append(p)
+        with open(os.path.join(self.base, "disk"), "w") as fh:
+            fh.write("sda\n")
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def _builder(self, strict=False):
+        objects = {}
+        if not strict:
+            step4 = _FakeWidget()
+            for wid in ("backup_step4_text", "backup_step4_thickness_box", "backup_step4_text2",
+                        "backup_step4_tree_scrolled", "backup_step4_when_ready_label"):
+                objects[wid] = _FakeWidget()
+                step4.pack_start(objects[wid])
+            objects["backup_step4_contentvbox"] = step4
+            step7 = _FakeWidget()
+            objects["backup_step6_when_ready_label"] = _FakeWidget()
+            step7.pack_start(objects["backup_step6_when_ready_label"])
+            objects["backup_step7_content_vbox2"] = step7
+            objects["backup_step6_compression_format_combobox"] = _FakeCompressionCombo("zstd")
+            objects["backup_folder_label"] = _FakeWidget(label=self.parent)
+
+        class _Builder:
+            def get_object(self_inner, name):
+                if strict:
+                    return objects.get(name)
+                return objects.setdefault(name, _FakeWidget())
+
+        return _Builder(), objects
+
+    def _handler(self, strict=False):
+        builder, objects = self._builder(strict)
+        h = self.Handler.__new__(self.Handler)
+        h.builder = builder
+        h.mode = self.ns["Mode"].BACKUP
+        h.current_page = self.ns["Page"].BACKUP_DESTINATION_FOLDER
+        h.selected_drive_key = "/dev/sda"
+        h.active_backup_drive_keys = ["/dev/sda"]
+        h.partitions_to_backup_by_drive = collections.OrderedDict(
+            [("/dev/sda", collections.OrderedDict(
+                [("/dev/sda1", {"filesystem": "ntfs"}), ("/dev/sda2", {"filesystem": "ext4"})]))]
+        )
+        h.drive_query = types.SimpleNamespace(
+            drive_state={"/dev/sda": {"partitions": {"/dev/sda1": {}, "/dev/sda2": {}}}}
+        )
+        h._init_differential_backup_ui()
+        return h, objects
+
+    def _drain_idle(self):
+        while self.idle:
+            fn, args = self.idle.pop(0)
+            fn(*args)
+
+    def _run_build(self, h, cancel_first=False):
+        h._on_build_base_index_clicked(None)
+        self.assertEqual(len(_DeferredThread.instances), 1)
+        thread = _DeferredThread.instances[0]
+        self.assertTrue(thread.started)
+        self.assertTrue(thread.daemon)
+        # GTK main thread returned immediately: nothing built yet, dialog shown
+        self.assertFalse(os.path.exists(os.path.join(self.base, bh.bhash_index_filename(self.PART))))
+        state = h._diff_bhash_build_state
+        self.assertTrue(state["dialog"].visible)
+        self.assertTrue(h.diff_bhash_build_in_progress)
+        self.assertFalse(h.diff_build_bhash_button.get_sensitive())
+        if cancel_first:
+            state["dialog"].emit("response", self.gtk.ResponseType.CANCEL)
+            self.assertTrue(state["cancel_event"].is_set())
+        thread.run()
+        self._drain_idle()
+        self.assertTrue(state["dialog"].destroyed)
+        self.assertFalse(h.diff_bhash_build_in_progress)
+        return state
+
+    def test_frame_is_injected_into_step4_not_step6(self):
+        h, objects = self._handler()
+        step4 = objects["backup_step4_contentvbox"].get_children()
+        frame = step4[-2]
+        self.assertIs(step4[-1], objects["backup_step4_when_ready_label"])
+        self.assertEqual(frame.kwargs.get("label"), "Backup Mode & Differential Base")
+        step7 = objects["backup_step7_content_vbox2"].get_children()
+        self.assertEqual(len(step7), 2)  # only the compression warning label + when-ready label
+        self.assertIs(step7[-1], objects["backup_step6_when_ready_label"])
+        self.assertFalse(step7[0].visible)
+        self.assertIsInstance(h.diff_checkbutton, _FakeRadio)
+        self.assertTrue(h.diff_full_radiobutton.get_active())
+        self.assertFalse(h.diff_checkbutton.get_active())
+        for attr in ("diff_base_combobox", "diff_browse_button", "diff_status_label",
+                     "diff_build_bhash_button", "diff_preview_label"):
+            self.assertIsNotNone(getattr(h, attr), attr)
+        self.assertFalse(h.diff_preview_scrolled.visible)  # Full mode: no preview
+        self.assertFalse(h.diff_build_bhash_button.visible)
+        self.assertEqual(objects["backup_step4_text"].get_padding(), (0, 2))  # compacted for 720p
+        # minimal builder: graceful skip
+        h2, _o = self._handler(strict=True)
+        self.assertIsNone(h2.diff_checkbutton)
+        self.assertEqual(h2.get_differential_backup_selection(), (None, None))
+
+    def test_full_mode_next_proposes_img_seekzilla(self):
+        h, objects = self._handler()
+        h.next_tab(None)
+        self.assertEqual(self.errors, [])
+        self.assertTrue(objects["backup_name"].get_text().endswith("-img-seekzilla"))
+        self.assertEqual(h.current_page, self.ns["Page"].BACKUP_IMAGE_NAME_SELECTION)
+        self.assertIsNone(h.diff_selection)
+
+    def test_unindexed_base_blocks_then_live_build_unblocks(self):
+        h, objects = self._handler()
+        h._on_image_folder_scan_complete()
+        h.diff_checkbutton.set_active(True)
+        self.assertFalse(h.diff_full_radiobutton.get_active())
+        self.assertEqual(h.diff_base_combobox.items, ["2026-11-20-0900-img-rescuezilla  [Needs .rzbhash index]"])
+        self.assertTrue(h.diff_preview_scrolled.visible)
+        self.assertIn("NEEDS INDEX", h.diff_preview_label.text)
+        self.assertTrue(h.diff_build_bhash_button.visible)
+        self.assertTrue(h.diff_build_bhash_button.get_sensitive())
+        # Next is blocked with an actionable message
+        h.next_tab(None)
+        self.assertEqual(h.current_page, self.ns["Page"].BACKUP_DESTINATION_FOLDER)
+        self.assertEqual(len(self.errors), 1)
+        self.assertIn("Build Base Index (.rzbhash)", self.errors[0])
+        self.assertIn("Info-bhash-*.rzbhash", self.errors[0])
+        # Live build (confirm -> background worker -> idle updates)
+        before = snapshot_tree(self.base)
+        state = self._run_build(h)
+        self.assertIn("read-only", _FakeMessageDialog.instances[0].secondary)
+        self.assertIn("Info-bhash-<part>.rzbhash", _FakeMessageDialog.instances[0].secondary)
+        self.assertEqual(state["built"], [self.PART])
+        self.assertEqual(state["errors"], [])
+        after = snapshot_tree(self.base)
+        new_files = sorted(set(after) - set(before))
+        self.assertEqual(new_files, [bh.bhash_index_filename(self.PART)])
+        for rel, meta in before.items():
+            if rel != ".":
+                self.assertEqual(after[rel], meta, rel)  # original backup files untouched
+        built = bh.load_bhash_file(os.path.join(self.base, bh.bhash_index_filename(self.PART)))
+        offline = bh.build_bhash_from_stream(io.BytesIO(self.img))
+        self.assertEqual(built.digests, offline.digests)
+        # candidate is now Ready, still selected, preview updated
+        self.assertEqual(h.diff_base_combobox.items, ["2026-11-20-0900-img-rescuezilla  [Ready]"])
+        self.assertEqual(h.diff_base_combobox.get_active(), 0)
+        self.assertFalse(h.diff_build_bhash_button.visible)
+        self.assertIn("DIFF", h.diff_preview_label.text)
+        self.assertIn("1 differential", h.diff_preview_label.text)
+        # Next now proceeds and proposes -diff-seekzilla directly
+        h.next_tab(None)
+        self.assertEqual(len(self.errors), 1)
+        self.assertEqual(h.current_page, self.ns["Page"].BACKUP_IMAGE_NAME_SELECTION)
+        self.assertTrue(objects["backup_name"].get_text().endswith("-diff-seekzilla"))
+        self.assertEqual(h.diff_selection["base_dirs_by_drive"], {"/dev/sda": self.base})
+        # Step 6 warning only for a differential backup with a non zstd/gzip format
+        h._update_diff_compression_warning()
+        warning = h.diff_compression_warning_label
+        self.assertFalse(warning.visible)
+        objects["backup_step6_compression_format_combobox"].fmt = "uncompressed"
+        h._update_diff_compression_warning()
+        self.assertTrue(warning.visible)
+        # Going back to Step 4 keeps the radio + base choice
+        h.prev_tab(None)
+        self.assertEqual(h.current_page, self.ns["Page"].BACKUP_DESTINATION_FOLDER)
+        self.assertTrue(h.diff_checkbutton.get_active())
+        self.assertEqual(h.get_differential_backup_selection()[0]["base_dir"], self.base)
+
+    def test_cancelled_build_leaves_no_files_and_stays_blocked(self):
+        h, _objects = self._handler()
+        h._on_image_folder_scan_complete()
+        h.diff_checkbutton.set_active(True)
+        before = sorted(os.listdir(self.base))
+        state = self._run_build(h, cancel_first=True)
+        self.assertTrue(state["cancelled"])
+        self.assertEqual(state["built"], [])
+        self.assertEqual(sorted(os.listdir(self.base)), before)
+        self.assertIn("[Needs .rzbhash index]", h.diff_base_combobox.items[0])
+        h.next_tab(None)
+        self.assertIn("Build Base Index (.rzbhash)", self.errors[-1])
+
+    def test_read_only_base_folder_is_refused(self):
+        h, _objects = self._handler()
+        h._on_image_folder_scan_complete()
+        h.diff_checkbutton.set_active(True)
+        with mock.patch.object(os, "access", return_value=False):
+            h._on_build_base_index_clicked(None)
+        self.assertEqual(_DeferredThread.instances, [])
+        self.assertIn("read-only", self.errors[-1])
+
+    def test_partition_change_refreshes_preview(self):
+        h, _objects = self._handler()
+        h._on_image_folder_scan_complete()
+        h.diff_checkbutton.set_active(True)
+        self.assertIn("sda2", h.diff_preview_label.text)
+        h.partitions_to_backup_by_drive["/dev/sda"] = collections.OrderedDict(
+            [("/dev/sda1", {"filesystem": "ntfs"})]
+        )
+        h._on_image_folder_scan_complete()  # re-scan after returning to Step 4
+        self.assertNotIn("sda2", h.diff_preview_label.text)
+        self.assertTrue(h.diff_checkbutton.get_active())
+
+    def test_drifted_base_blocks_next_and_hides_build_button(self):
+        h, objects = self._handler()
+        model = "Samsung SSD 980 PRO 1TB"
+        cap = 1000204886016
+        # Replace disk + add blkdev.list so base was recorded as sdb while active drive is sda
+        with open(os.path.join(self.base, "disk"), "w") as fh:
+            fh.write("sdb\n")
+        with open(os.path.join(self.base, "blkdev.list"), "w") as fh:
+            fh.write(_blkdev_list_text("sdb", "931.5G", model))
+        h.drive_query.drive_state = {
+            "/dev/sda": {"model": model, "capacity": cap, "partitions": {"/dev/sda1": {}}}
+        }
+        h._on_image_folder_scan_complete()
+        h.diff_checkbutton.set_active(True)
+        self.assertIn("Device name changed: sdb -> sda", h.diff_base_combobox.items[0])
+        self.assertFalse(h.diff_build_bhash_button.visible)
+        h.next_tab(None)
+        self.assertEqual(h.current_page, self.ns["Page"].BACKUP_DESTINATION_FOLDER)
+        self.assertIn("different device name", self.errors[-1])
+
+    def test_switching_destination_folder_resets_diff_to_full_when_base_disappears(self):
+        h, objects = self._handler()
+        h._on_image_folder_scan_complete()
+        h.diff_checkbutton.set_active(True)
+        self.assertTrue(h.diff_checkbutton.get_active())
+        other_parent = os.path.join(self._td.name, "other-folder")
+        os.makedirs(other_parent)
+        objects["backup_folder_label"].set_text(other_parent)
+        h._on_image_folder_scan_complete()
+        self.assertFalse(h.diff_checkbutton.get_active())
+        self.assertTrue(h.diff_full_radiobutton.get_active())
 
 
 if __name__ == "__main__":

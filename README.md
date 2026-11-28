@@ -1,8 +1,8 @@
 [![Rescuezilla banner](docs/images/banner.big.png)](https://rescuezilla.com)
 
-# SeekZilla（瞬尋救援龍）— Seekable Index, Multi-Disk & Hybrid Differential Backup (`v2.1`)
+# SeekZilla（瞬尋救援龍）— Seekable Index, Multi-Disk & Hybrid Differential Backup (`v2.2`)
 
-> **非官方衍生分支聲明（GPL-3.0-or-later）**：**SeekZilla** 為 [rescuezilla/rescuezilla](https://github.com/rescuezilla/rescuezilla) 的社群衍生分支（分支 `feature/seekable-index`，最新定版標籤 [`2.7.0-seekzilla-v2.1`](https://github.com/swho/rescuezilla/releases/tag/2.7.0-seekzilla-v2.1)），與官方 Rescuezilla 專案無隸屬或背書關係。所有修改與全新設計視覺素材均依 **GNU GPL v3.0 or later** 釋出，詳細修改紀錄與實測證據請見 [`FORK_NOTES.md`](FORK_NOTES.md)。
+> **非官方衍生分支聲明（GPL-3.0-or-later）**：**SeekZilla** 為 [rescuezilla/rescuezilla](https://github.com/rescuezilla/rescuezilla) 的社群衍生分支（分支 `feature/seekable-index`，最新定版標籤 [`2.7.0-seekzilla-v2.2`](https://github.com/swho/rescuezilla/releases/tag/2.7.0-seekzilla-v2.2)），與官方 Rescuezilla 專案無隸屬或背書關係。所有修改與全新設計視覺素材均依 **GNU GPL v3.0 or later** 釋出，詳細修改紀錄與實測證據請見 [`FORK_NOTES.md`](FORK_NOTES.md)。
 
 ---
 
@@ -13,13 +13,13 @@
 2. **一次只能備份一顆磁碟**：擁有多顆硬碟時，必須守在電腦前等第一顆備份數小時結束，再手動重走一次精靈流程。
 3. **每次都得重新寫入數百 GB 完整備份**：日常僅異動少數檔案，卻沒有基準點差異備份機制。
 
-**SeekZilla (`v2.0`)** 在 **完整備份（Base）維持 100% 官方 Rescuezilla / Clonezilla 還原格式相容** 的前提下，新增以下能力：
+**SeekZilla (`v2.2`)** 在 **完整備份（Base）維持 100% 官方 Rescuezilla / Clonezilla 還原格式相容** 的前提下，新增以下能力：
 
-| 功能項目 | 官方原版 Rescuezilla | SeekZilla (`v2.0`) |
+| 功能項目 | 官方原版 Rescuezilla | SeekZilla (`v2.2`) |
 |---|---|---|
 | **隨機存取索引（`.rzidx`）** | 無（需 `O(N)` 整包線性解壓，常耗時數十分鐘～數小時） | **備份時同步原子寫入 `Info-seekidx-<part>.rzidx`**，支援 `O(1)` 毫秒級定位單幀（實測 1.18 TiB 實體備份 **0.000s～0.543s** 瞬開） |
-| **混合區塊級差異備份（`.rzbhash` + `rzdiff`）** | 無（每次皆需重寫整顆磁碟完整備份） | **Base 完整備份同步產出 1 MiB LBA SHA-256 雜湊索引（`.rzbhash`）**；後續差異備份僅儲存異動區塊（Depth-1，**永不修改 Base**），支援直接整碟還原、`partclone.chkimg` 校驗、一鍵 `merge` 合併回原版獨立完整映像、以及免解壓瞬開單檔瀏覽 |
-| **舊版完整備份事後補建索引** | 無 | 內建離線唯讀工具 **`block_hash.py build-from-image`**，可將既有 v1.0 / v1.1 完整備份補建 `.rzbhash` 直接升級為差異基準 |
+| **混合區塊級差異備份（`.rzbhash` + `rzdiff`）** | 無（每次皆需重寫整顆磁碟完整備份） | **Step 4 選完目的資料夾即自動掃描並選擇完整／差異備份**，即時預覽各分割區 `DIFF`／`FULL`／`NEEDS INDEX` 計畫（3 區變 4 區、改格式、磁碟名稱漂移均清楚標示）；差異備份僅儲存異動 1 MiB 區塊（Depth-1，**永不修改 Base**），支援直接整碟還原、`partclone.chkimg` 校驗、一鍵 `merge` 合併回原版獨立完整映像、以及免解壓瞬開單檔瀏覽 |
+| **舊版完整備份一鍵補建索引** | 無 | **Live USB Step 4 內建「Build Base Index (.rzbhash)...」即時補建按鈕**（利用 `.rzidx` 多核心並行解壓、即時顯示進度/MB/s/ETA、可安全取消、對原檔嚴格唯讀），亦可於 `SeekZilla Browser` GUI 或 CLI `block_hash.py build-from-image` 離線補建，一口氣完成補建＋差異備份 |
 | **多磁碟一次備份** | Step 1 僅能單選 1 顆硬碟 | **Step 1 新增 `Backup` 勾選欄**，可一次勾選多顆硬碟，依序輸出為各自獨立標準目錄 `<基礎名稱>-<磁碟>`（單選維持原名無後綴） |
 | **壓縮引擎與預設格式** | 預設 `gzip -6`（`pigz`） | **預設 `zstd -3` 原生 `libzstd.so.1`（4 MiB 獨立幀 + XXH64）**；`gzip -6` 亦導入原生 **`libdeflate.so.0`（1 MiB 獨立幀）**，並依可用核心與 RAM/CCtx 自動解鎖全核心 |
 | **開機與介面視覺識別／4K 顯示自適應** | Rescuezilla 傳統介面（4K 螢幕字體極小） | 全新 **SeekZilla** 深海藍（`#0F172A`）+ 電光青（`#38BDF8`）向量視覺（GRUB、Plymouth、桌布、GTK 橫幅、Openbox 自動最大化）；**4K / HiDPI 螢幕開機自動切換至易讀 1080p（或 `seekzilla_display=720p` / `native`）**，支援 16:10／21:9／32:9 原生比例、單模式 4K 面板 2× 縮放與 `efifb`/安全模式 DPI 備援，GRUB 亦優先 720p/1024×768/1080p |
@@ -53,7 +53,7 @@
 | **Ubuntu 24.04 Noble（6 核容器，64 MiB 真實系統執行檔語料）** | 舊 `zlib1g gzip -6 (8t, 1M)`：`189.5 MB/s` (41.24%) → 新 `libdeflate gzip -6 (auto, 1M)`：**`727.3 MB/s` (3.84×, 40.91%)** → 新預設 `libzstd zstd -3 (auto, 4M)`：**`1,745.6 MB/s` (9.21×, 39.66%)** |
 | **VMware Live ISO 實機（2 vCPU / 2 GiB RAM，64 MiB 語料）** | 舊 `zlib1g`：`73.8 MB/s` (39.84%) → 新 `libdeflate`：**`243.6 MB/s` (3.30×, 39.25%)** → 新預設 `libzstd 4M`：**`715.9 MB/s` (9.70×, 33.70%)** |
 | **實體雙 NVMe 裸機多磁碟備份稽核（i9-13980HX，2.271 TiB → 1.153 TiB）** | 9 個分區全數 `Partclone exit code: 0`、`Info-img-id.txt` SHA-512 100% 吻合、抽樣解壓 496 個 frame（含全部 314 個跨 4 GB split 邊界幀）**0 錯誤**；全部 8 個可瀏覽分區透過 `.rzidx` 於 **0.000s～0.543s** 瞬開 |
-| **自動化單元測試與 Live E2E (`v2.1`)** | Noble Docker 單元測試 **194 / 194 通過**（含 57 項 4K 顯示自適應測試）+ `SeekZilla Browser` **217 / 217 通過**（含 GUI 事後補建 `.rzbhash` 跨 repo 逐位元組互通測試，`ruff` 0 錯誤）；VMware Live ISO 實機完成 FAT32 / Btrfs / NTFS Full Base → V2 異動 → 差異備份（大小僅為 Base 的 **8.8%**、Base 零異動）→ `VerifyManager` (`partclone.chkimg`) → 1-bit 基準損毀阻斷（exit `4`）→ `partclone.restore` V2 100% SHA-256 吻合 → `merge` 合併回原版完整映像 → `SeekZilla Browser` **0.002s～0.004s** 瞬開與 100% SHA-256 復原 |
+| **自動化單元測試與 Live E2E (`v2.2`)** | Noble Docker 單元測試 **220 / 220 通過**（含 Step 4 整合流程、多核心 `.rzidx` 並行補建 `.rzbhash`、分區增減與漂移防護、57 項 4K 顯示自適應測試）+ 實機 GTK3 `1280×666` 零裁切視覺驗證 + `SeekZilla Browser` **217 / 217 通過**（`ruff` 0 錯誤）；VMware Live ISO 實機完成 FAT32 / Btrfs / NTFS Full Base → V2 異動 → 差異備份（大小僅為 Base 的 **8.8%**、Base 零異動）→ `VerifyManager` (`partclone.chkimg`) → 1-bit 基準損毀阻斷（exit `4`）→ `partclone.restore` V2 100% SHA-256 吻合 → `merge` 合併回原版完整映像 → `SeekZilla Browser` **0.002s～0.004s** 瞬開與 100% SHA-256 復原 |
 
 ---
 

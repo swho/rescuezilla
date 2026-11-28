@@ -11,6 +11,11 @@
 #   selection (base image discovery, Browse..., confirmation text) and
 #   "-img-seekzilla" / "-diff-seekzilla" default folder names
 #   (GPL-3.0-or-later).
+#   Modified 2026-11-28 (Community Fork): SeekZilla v2.2 moves the Backup
+#   Mode & Differential Base selection to Step 4, adds the per-partition
+#   Diff/Full preview, Needs-.rzbhash base discovery (incl. blkdev.list
+#   drift matching) and the in-app background "Build Base Index (.rzbhash)"
+#   builder (GPL-3.0-or-later).
 # ----------------------------------------------------------------------
 #   This program is free software: you can redistribute it and/or modify
 #   it under the terms of the GNU General Public License as published by
@@ -30,9 +35,11 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 import traceback
 from datetime import datetime
 
+import block_hash
 from backup_manager import BackupManager, compute_backup_dest_dirs
 from gtk_ui_manager import GtkUiManager
 from clone_manager import CloneManager
@@ -68,14 +75,16 @@ from wizard_state import (
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk, GObject  # noqa: E402
+from gi.repository import Gtk, GObject, GLib, Pango  # noqa: E402
 
 # SeekZilla default backup folder suffixes (full / differential)
 SEEKZILLA_FULL_FOLDER_SUFFIX = "-img-seekzilla"
 SEEKZILLA_DIFF_FOLDER_SUFFIX = "-diff-seekzilla"
 
 
-def discover_compatible_base_images(parent_dir, drive_keys, drive_state):
+def discover_compatible_base_images(
+    parent_dir, drive_keys, drive_state, include_needs_bhash=False
+):
     """Find full SeekZilla images in `parent_dir` usable as a differential base.
 
     Pure logic (stdlib only, no GTK): scans the immediate subdirectories of
@@ -94,6 +103,23 @@ def discover_compatible_base_images(parent_dir, drive_keys, drive_state):
     Returns a list of dicts (complete matches first, then newest first) with
     keys: label, name, base_dir, base_dirs_by_drive, missing_drives,
     matched_partitions, is_multi_drive, mtime.
+
+    `include_needs_bhash=True` (SeekZilla v2.2 Step 4 UI) additionally:
+    - offers full Rescuezilla / Clonezilla backups whose Partclone images
+      (`<part>.<fs>-ptcl-img.<zst|gz|uncomp>.aa`) have no `.rzbhash` yet (a
+      present but structurally invalid `.rzbhash` counts as missing);
+    - matches a drive whose device name changed since the base was taken
+      (e.g. nvme0n1 <-> nvme1n1 swap) through `blkdev.list` MODEL + SIZE vs
+      `drive_state[dk]["model"]` / `["capacity"]`, only when exactly one
+      drive of `drive_state` matches (`device_name_drifted` is set);
+    - adds ready, has_any_bhash, needs_bhash, fully_indexed,
+      missing_bhash_by_drive ({dk: [(base_dir, [PtclImageSet, ...])]}),
+      missing_bhash_count, missing_bhash_bytes, device_name_drifted,
+      drifted_drives ({dk: base drive name}), base_parts_by_drive;
+    - labels candidates `<name>  [Ready]` / `<name>  [Needs .rzbhash index]`
+      (multi-drive: `<name>  (<found>/<total> drives · Ready)`) and sorts
+      Ready candidates first.
+    With the default `include_needs_bhash=False` the behaviour is unchanged.
     """
     import collections as _collections
     import os as _os
@@ -103,6 +129,55 @@ def discover_compatible_base_images(parent_dir, drive_keys, drive_state):
     bhash_prefix = "Info-bhash-"
     bhash_suffix = ".rzbhash"
     ts_re = _re.compile(r"^(\d{4}-\d{2}-\d{2}-\d{4})")
+    needs_mode = bool(include_needs_bhash)
+    _bh = None
+    if needs_mode:
+        try:
+            import block_hash as _bh
+        except ImportError:
+            from rescuezilla import block_hash as _bh  # type: ignore[no-redef]
+
+    def _norm_model(text):
+        return " ".join(str(text or "").replace("\\x20", " ").split()).lower()
+
+    def _parse_lsblk_size(tok):
+        m = _re.match(r"^([0-9]+(?:[.,][0-9]+)?)([BKMGTPEZ]?)(?:i?B)?$", str(tok).strip())
+        if not m:
+            return None
+        unit = 1024 ** "BKMGTPEZ".index(m.group(2) or "B")
+        return float(m.group(1).replace(",", ".")) * unit, unit
+
+    def _read_blkdev_list(path):
+        """First `disk` row of Clonezilla/Rescuezilla `blkdev.list` (lsblk table)."""
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            return None
+        if not lines:
+            return None
+        model_off = lines[0].find("MODEL")
+        for line in lines[1:]:
+            toks = line.split()
+            if len(toks) < 4 or toks[3] != "disk":
+                continue
+            parsed = _parse_lsblk_size(toks[2])
+            model = ""
+            if model_off >= 0 and len(line) > model_off:
+                model = line[model_off:].strip()
+            return {
+                "kname": toks[0],
+                "size": parsed[0] if parsed else None,
+                "unit": parsed[1] if parsed else None,
+                "model": _norm_model(model),
+            }
+        return None
+
+    def _drive_capacity(info):
+        try:
+            return float(int(str(info.get("capacity")).strip()))
+        except (TypeError, ValueError, AttributeError):
+            return None
 
     def _short_drive(dk):
         short = _re.sub(r"^/dev/", "", str(dk).strip())
@@ -151,7 +226,15 @@ def discover_compatible_base_images(parent_dir, drive_keys, drive_state):
             and e.endswith(bhash_suffix)
             and len(e) > len(bhash_prefix) + len(bhash_suffix)
         )
-        if not bhash_parts:
+        status = None
+        if needs_mode:
+            try:
+                status = _bh.inspect_base_dir_bhash_status(path)
+            except Exception:
+                status = None
+            if not bhash_parts and not (status and status["ptcl_parts"]):
+                continue
+        elif not bhash_parts:
             continue
         disks = []
         if "disk" in entries:
@@ -164,42 +247,187 @@ def discover_compatible_base_images(parent_dir, drive_keys, drive_state):
             mtime = _os.path.getmtime(path)
         except OSError:
             mtime = 0.0
-        folders.append(
-            {"name": name, "path": path, "bhash_parts": bhash_parts, "disks": disks, "mtime": mtime}
-        )
+        folder = {"name": name, "path": path, "bhash_parts": bhash_parts, "disks": disks, "mtime": mtime}
+        if needs_mode:
+            ptcl_parts = list(status["ptcl_parts"]) if status else []
+            folder["ptcl_parts"] = ptcl_parts
+            folder["missing_images"] = list(status["missing_images"]) if status else []
+            folder["missing_bytes"] = int(status["total_missing_compressed_bytes"]) if status else 0
+            folder["has_any_bhash"] = (
+                bool(status["bhash_parts"]) if ptcl_parts else bool(bhash_parts)
+            )
+            folder["blkdev"] = (
+                _read_blkdev_list(_os.path.join(path, "blkdev.list"))
+                if "blkdev.list" in entries
+                else None
+            )
+        folders.append(folder)
+
+    all_drives = drive_state if isinstance(drive_state, dict) else {}
+
+    def _blkdev_contradicts(folder, dk):
+        """True when blkdev.list MODEL+SIZE definitely describes a different physical disk."""
+        info = folder.get("blkdev") if needs_mode else None
+        if not info or not info["model"] or info["size"] is None:
+            return False
+        dinfo = all_drives.get(dk)
+        if not isinstance(dinfo, dict):
+            return False
+        dmodel = _norm_model(dinfo.get("model"))
+        cap = _drive_capacity(dinfo)
+        if not dmodel or cap is None:
+            return False
+        tolerance = 0.051 * info["unit"] + 1
+        return dmodel != info["model"] or abs(cap - info["size"]) > tolerance
 
     def _suffix_match(folder, dk):
-        return folder["name"].endswith("-" + shorts[dk])
+        if not folder["name"].endswith("-" + shorts[dk]):
+            return False
+        return not _blkdev_contradicts(folder, dk)
+
+    def _known_parts(folder):
+        if needs_mode:
+            return set(folder["bhash_parts"]) | set(folder["ptcl_parts"])
+        return set(folder["bhash_parts"])
 
     def _content_match(folder, dk):
+        if _blkdev_contradicts(folder, dk):
+            return False
         if shorts[dk] in folder["disks"]:
             return True
         if not folder["disks"]:
-            return bool(part_shorts[dk] & set(folder["bhash_parts"]))
+            return bool(part_shorts[dk] & _known_parts(folder))
         return False
 
     def _matched_partitions(folder, dk):
         return sorted(part_shorts[dk] & set(folder["bhash_parts"]))
+
+    # Hardware drift fallback (needs mode only): blkdev.list MODEL + SIZE.
+    def _blkdev_match(folder):
+        """The single selected drive matching the folder's blkdev.list, else None."""
+        info = folder.get("blkdev") if needs_mode else None
+        if not info or not info["model"] or info["size"] is None:
+            return None
+        tolerance = 0.051 * info["unit"] + 1
+        hits = []
+        for dk, dinfo in all_drives.items():
+            if not isinstance(dinfo, dict):
+                continue
+            cap = _drive_capacity(dinfo)
+            if cap is None or _norm_model(dinfo.get("model")) != info["model"]:
+                continue
+            if abs(cap - info["size"]) <= tolerance:
+                hits.append(dk)
+        if len(hits) != 1 or hits[0] not in shorts:
+            return None
+        return hits[0]
+
+    def _base_drive_name(folder):
+        info = folder.get("blkdev")
+        if info and info.get("kname"):
+            return info["kname"]
+        if len(folder["disks"]) == 1:
+            return folder["disks"][0]
+        return None
+
+    def _is_drifted(folder, dk):
+        if _suffix_match(folder, dk) or (
+            not _blkdev_contradicts(folder, dk) and shorts[dk] in folder["disks"]
+        ):
+            return False
+        base_name = _base_drive_name(folder)
+        return base_name is not None and base_name != shorts[dk]
+
+    def _decorate(candidate, folder_by_drive):
+        """needs-mode readiness fields + label for one candidate."""
+        missing_by_drive = _collections.OrderedDict()
+        count = 0
+        nbytes = 0
+        any_bhash = False
+        drifted = _collections.OrderedDict()
+        base_parts = {}
+        for dk, folder in folder_by_drive.items():
+            is_drifted = _is_drifted(folder, dk)
+            if is_drifted:
+                drifted[dk] = _base_drive_name(folder)
+            else:
+                any_bhash = any_bhash or folder["has_any_bhash"]
+                if folder["missing_images"]:
+                    missing_by_drive[dk] = [(folder["path"], list(folder["missing_images"]))]
+                    count += len(folder["missing_images"])
+                    nbytes += folder["missing_bytes"]
+            base_parts[dk] = sorted(_known_parts(folder))
+        all_drifted = bool(drifted) and len(drifted) == len(folder_by_drive)
+        needs = bool(missing_by_drive)
+        candidate.update(
+            {
+                "has_any_bhash": any_bhash,
+                "needs_bhash": needs,
+                "fully_indexed": (not needs) and (not all_drifted),
+                "ready": any_bhash and not needs and not all_drifted,
+                "missing_bhash_by_drive": dict(missing_by_drive),
+                "missing_bhash_count": count,
+                "missing_bhash_bytes": nbytes,
+                "device_name_drifted": bool(drifted),
+                "all_drifted": all_drifted,
+                "drifted_drives": dict(drifted),
+                "base_parts_by_drive": base_parts,
+            }
+        )
+        if all_drifted:
+            if candidate["is_multi_drive"]:
+                candidate["label"] = "{name}  ({found}/{total} drives · Device name changed)".format(
+                    name=candidate["name"],
+                    found=len(candidate["base_dirs_by_drive"]),
+                    total=len(keys),
+                )
+            else:
+                dk_only, old_name = next(iter(drifted.items()))
+                candidate["label"] = "{name}  [Device name changed: {old} -> {new}]".format(
+                    name=candidate["name"],
+                    old=old_name or "?",
+                    new=shorts[dk_only],
+                )
+        else:
+            state_text = "Ready" if candidate["ready"] else "Needs .rzbhash index"
+            if candidate["is_multi_drive"]:
+                candidate["label"] = "{name}  ({found}/{total} drives · {state})".format(
+                    name=candidate["name"],
+                    found=len(candidate["base_dirs_by_drive"]),
+                    total=len(keys),
+                    state=state_text,
+                )
+            else:
+                candidate["label"] = "{name}  [{state}]".format(name=candidate["name"], state=state_text)
+        return candidate
+
+    def _needs_sort_key(c):
+        return (bool(c.get("all_drifted")), not c["ready"], len(c["missing_drives"]), -c["mtime"], c["name"])
 
     results = []
     if len(keys) == 1:
         dk = keys[0]
         for folder in folders:
             if not (_suffix_match(folder, dk) or _content_match(folder, dk)):
-                continue
-            results.append(
-                {
-                    "label": folder["name"],
-                    "name": folder["name"],
-                    "base_dir": folder["path"],
-                    "base_dirs_by_drive": {dk: folder["path"]},
-                    "missing_drives": [],
-                    "matched_partitions": {dk: _matched_partitions(folder, dk)},
-                    "is_multi_drive": False,
-                    "mtime": folder["mtime"],
-                }
-            )
-        results.sort(key=lambda c: (-c["mtime"], c["name"]))
+                if not (needs_mode and _blkdev_match(folder) == dk):
+                    continue
+            candidate = {
+                "label": folder["name"],
+                "name": folder["name"],
+                "base_dir": folder["path"],
+                "base_dirs_by_drive": {dk: folder["path"]},
+                "missing_drives": [],
+                "matched_partitions": {dk: _matched_partitions(folder, dk)},
+                "is_multi_drive": False,
+                "mtime": folder["mtime"],
+            }
+            if needs_mode:
+                _decorate(candidate, {dk: folder})
+            results.append(candidate)
+        if needs_mode:
+            results.sort(key=_needs_sort_key)
+        else:
+            results.sort(key=lambda c: (-c["mtime"], c["name"]))
         return results
 
     # Multi-drive: group sibling folders.
@@ -214,27 +442,41 @@ def discover_compatible_base_images(parent_dir, drive_keys, drive_state):
                     group[dk] = folder
                     used.add(folder["path"])
                 break
+    def _place(folder, dk):
+        """Group a renamed / drifted folder by its timestamp prefix (True if placed)."""
+        m = ts_re.match(folder["name"])
+        ts = m.group(1) if m else None
+        target = None
+        if ts is not None:
+            for gkey, group in groups.items():
+                if gkey.startswith(ts) and dk not in group:
+                    target = gkey
+                    break
+        if target is None:
+            target = ts if ts is not None else folder["name"]
+        group = groups.setdefault(target, _collections.OrderedDict())
+        if dk not in group:
+            group[dk] = folder
+            used.add(folder["path"])
+            return True
+        return False
+
     for folder in folders:  # pass 2: renamed siblings matched by disk file / partitions
         if folder["path"] in used:
             continue
         for dk in keys:
             if not _content_match(folder, dk):
                 continue
-            m = ts_re.match(folder["name"])
-            ts = m.group(1) if m else None
-            target = None
-            if ts is not None:
-                for gkey, group in groups.items():
-                    if gkey.startswith(ts) and dk not in group:
-                        target = gkey
-                        break
-            if target is None:
-                target = ts if ts is not None else folder["name"]
-            group = groups.setdefault(target, _collections.OrderedDict())
-            if dk not in group:
-                group[dk] = folder
-                used.add(folder["path"])
+            if _place(folder, dk):
                 break
+
+    if needs_mode:  # pass 3: device names drifted, matched by blkdev.list model + size
+        for folder in folders:
+            if folder["path"] in used:
+                continue
+            dk = _blkdev_match(folder)
+            if dk is not None:
+                _place(folder, dk)
 
     total = len(keys)
     for gkey, group in groups.items():
@@ -244,24 +486,247 @@ def discover_compatible_base_images(parent_dir, drive_keys, drive_state):
         if not by_drive:
             continue
         missing = [dk for dk in keys if dk not in group]
-        results.append(
+        candidate = {
+            "label": "{name} ({found}/{total} drives)".format(
+                name=gkey, found=len(by_drive), total=total
+            ),
+            "name": gkey,
+            "base_dir": next(iter(by_drive.values())),
+            "base_dirs_by_drive": dict(by_drive),
+            "missing_drives": missing,
+            "matched_partitions": {
+                dk: _matched_partitions(group[dk], dk) for dk in by_drive
+            },
+            "is_multi_drive": True,
+            "mtime": max(group[dk]["mtime"] for dk in by_drive),
+        }
+        if needs_mode:
+            _decorate(candidate, _collections.OrderedDict((dk, group[dk]) for dk in by_drive))
+        results.append(candidate)
+    if needs_mode:
+        results.sort(key=_needs_sort_key)
+    else:
+        results.sort(key=lambda c: (len(c["missing_drives"]), -c["mtime"], c["name"]))
+    return results
+
+
+def build_differential_partition_preview(drive_keys, partitions_to_backup_by_drive, candidate):
+    """Per-drive / per-partition Diff vs Full preview for the Step 4 UI (pure logic).
+
+    For every selected drive `dk` and partition `pk`
+    (`partitions_to_backup_by_drive[dk][pk]` is the drive_state partition dict,
+    whose "filesystem" is used) decide:
+      - "full": no base for the drive / partclone.dd (or other non-Partclone)
+        partition / partition not in the base;
+      - "diff": the base has `Info-bhash-<short_part>.rzbhash`;
+      - "pending_bhash": the base has the Partclone image but no (valid)
+        `.rzbhash` yet (Build Base Index makes it "diff"; otherwise it is saved
+        as full).
+    `omitted_base_parts` lists partitions present in the base that are not
+    selected in Step 2.
+
+    Returns {"drives": [...], "diff_count", "full_count", "pending_bhash_count",
+    "omitted_base_parts": {dk: [...]}, "summary_text"}.
+    """
+    import os as _os
+    import re as _re
+
+    ptcl_re = _re.compile(
+        r"^(?P<part>[^/\\]+?)\.(?P<fs>[^./\\]+)-ptcl-img\.(?P<comp>[A-Za-z0-9]+)\.aa$"
+    )
+    indexable_comps = ("zst", "gz", "uncomp")
+    raw_fs = ("dd", "raw", "unknown", "", "none")
+    bhash_prefix = "Info-bhash-"
+    bhash_suffix = ".rzbhash"
+
+    def _short_drive(dk):
+        short = _re.sub(r"^/dev/", "", str(dk).strip())
+        short = _re.sub(r"[^A-Za-z0-9._-]+", "_", short).strip("._-")
+        return short or "disk"
+
+    def _short_partition(pk):
+        return _re.sub("/", "-", _re.sub(r"^/dev/", "", str(pk).strip()))
+
+    def _fs_family(name):
+        f = str(name or "").strip().lower()
+        if f in ("fat12", "fat16", "fat32", "vfat", "fat"):
+            return "fat"
+        if f in ("ext2", "ext3", "ext4", "extfs"):
+            return "ext"
+        if f in ("hfs+", "hfsplus", "hfsp"):
+            return "hfsp"
+        return f
+
+    parts_by_drive = partitions_to_backup_by_drive or {}
+    if isinstance(drive_keys, str):
+        keys = [drive_keys]
+    else:
+        keys = list(drive_keys or [])
+    for dk in parts_by_drive:
+        if dk not in keys:
+            keys.append(dk)
+    cand = candidate if isinstance(candidate, dict) else {}
+    base_dirs = dict(cand.get("base_dirs_by_drive") or {})
+    drifted = dict(cand.get("drifted_drives") or {})
+
+    pending_by_drive = {}
+    for dk, items in (cand.get("missing_bhash_by_drive") or {}).items():
+        shorts = set()
+        for item in items or []:
+            try:
+                _base_dir, images = item
+            except (TypeError, ValueError):
+                continue
+            for img in images or []:
+                sp = getattr(img, "short_part", None)
+                if sp is None and isinstance(img, dict):
+                    sp = img.get("short_part")
+                if sp:
+                    shorts.add(sp)
+        pending_by_drive[dk] = shorts
+
+    scanned = {}
+
+    def _scan(base_dir):
+        if base_dir not in scanned:
+            bhash, images = set(), {}
+            try:
+                entries = sorted(_os.listdir(base_dir))
+            except OSError:
+                entries = []
+            for e in entries:
+                if (
+                    e.startswith(bhash_prefix)
+                    and e.endswith(bhash_suffix)
+                    and len(e) > len(bhash_prefix) + len(bhash_suffix)
+                ):
+                    bhash.add(e[len(bhash_prefix) : -len(bhash_suffix)])
+                m = ptcl_re.match(e)
+                if m:
+                    images.setdefault(m.group("part"), (m.group("fs"), m.group("comp")))
+            scanned[base_dir] = (bhash, images)
+        return scanned[base_dir]
+
+    drives = []
+    counts = {"diff": 0, "full": 0, "pending_bhash": 0}
+    omitted_by_drive = {}
+    lines = []
+    for dk in keys:
+        parts = parts_by_drive.get(dk) or {}
+        base_dir = base_dirs.get(dk)
+        bhash, images = _scan(base_dir) if base_dir else (set(), {})
+        pending = pending_by_drive.get(dk, set())
+        entries = []
+        selected_shorts = set()
+        for pk, pinfo in parts.items():
+            short = _short_partition(pk)
+            selected_shorts.add(short)
+            info = pinfo if isinstance(pinfo, dict) else {}
+            fs = str(info.get("filesystem") or "").strip().lower()
+            is_extended = "extended" in str(info.get("type") or "")
+            if not base_dir:
+                mode, reason = "full", "no compatible base for this drive"
+            elif dk in drifted:
+                mode, reason = (
+                    "full",
+                    "drive name changed ({old} -> {new}) — saved as full".format(
+                        old=drifted.get(dk) or "?", new=_short_drive(dk)
+                    ),
+                )
+            elif fs in raw_fs:
+                mode, reason = "full", "partclone.dd — differential not applicable"
+            elif fs == "swap" or is_extended:
+                mode, reason = "full", "not a Partclone filesystem — differential not applicable"
+            elif (
+                short in images
+                and fs
+                and images[short][0] != "dd"
+                and _fs_family(fs) != _fs_family(images[short][0])
+            ):
+                mode, reason = (
+                    "full",
+                    "filesystem changed ({old} -> {new}) — saved as full".format(
+                        old=images[short][0], new=fs
+                    ),
+                )
+            elif short in pending and short in images:
+                mode, reason = "pending_bhash", "missing .rzbhash — click Build Base Index"
+            elif short in bhash:
+                mode, reason = "diff", "differential vs base .rzbhash"
+            elif short in images:
+                base_fs, comp = images[short]
+                if base_fs == "dd":
+                    mode, reason = "full", "base saved it with partclone.dd — saved as full"
+                elif comp in indexable_comps:
+                    mode, reason = "pending_bhash", "missing .rzbhash — click Build Base Index"
+                else:
+                    mode, reason = "full", "base compression ." + comp + " cannot be indexed — saved as full"
+            else:
+                mode, reason = "full", "not in base — saved as standalone full partition"
+            counts[mode] += 1
+            entries.append(
+                {"partition": pk, "short_part": short, "filesystem": fs, "mode": mode, "reason": reason}
+            )
+        omitted = sorted((set(bhash) | set(images)) - selected_shorts) if base_dir else []
+        omitted_by_drive[dk] = omitted
+        drives.append(
             {
-                "label": "{name} ({found}/{total} drives)".format(
-                    name=gkey, found=len(by_drive), total=total
-                ),
-                "name": gkey,
-                "base_dir": next(iter(by_drive.values())),
-                "base_dirs_by_drive": dict(by_drive),
-                "missing_drives": missing,
-                "matched_partitions": {
-                    dk: _matched_partitions(group[dk], dk) for dk in by_drive
-                },
-                "is_multi_drive": True,
-                "mtime": max(group[dk]["mtime"] for dk in by_drive),
+                "drive": dk,
+                "short_drive": _short_drive(dk),
+                "base_dir": base_dir,
+                "partitions": entries,
+                "omitted_base_parts": omitted,
+                "device_name_drifted": dk in drifted,
+                "base_drive_name": drifted.get(dk),
             }
         )
-    results.sort(key=lambda c: (len(c["missing_drives"]), -c["mtime"], c["name"]))
-    return results
+
+        if base_dir:
+            head = "{drive}  ← base: {base}".format(
+                drive=_short_drive(dk), base=_os.path.basename(_os.path.normpath(base_dir))
+            )
+        else:
+            head = "{drive}  ← no compatible base (full backup)".format(drive=_short_drive(dk))
+        lines.append(head)
+        if dk in drifted:
+            lines.append(
+                "  ! device name changed (base: {old}, now: {new}); partitions whose names differ are saved as full".format(
+                    old=drifted.get(dk) or "?", new=_short_drive(dk)
+                )
+            )
+        width = max([len(e["short_part"]) for e in entries] + [4])
+        fs_width = max([len(e["filesystem"] or "-") for e in entries] + [2])
+        tags = {"diff": "DIFF", "full": "FULL", "pending_bhash": "NEEDS INDEX"}
+        for e in entries:
+            lines.append(
+                "  {part}  {fs}  {tag:<11}  {reason}".format(
+                    part=e["short_part"].ljust(width),
+                    fs=(e["filesystem"] or "-").ljust(fs_width),
+                    tag=tags[e["mode"]],
+                    reason=e["reason"],
+                )
+            )
+        if omitted:
+            lines.append(
+                "  in base but not selected (not included): " + ", ".join(omitted)
+            )
+    lines.append(
+        "Total: {d} differential · {f} full · {p} waiting for .rzbhash".format(
+            d=counts["diff"], f=counts["full"], p=counts["pending_bhash"]
+        )
+    )
+    if counts["pending_bhash"]:
+        lines.append(
+            "Partitions waiting for .rzbhash are saved as full unless you click 'Build Base Index (.rzbhash)...' first."
+        )
+    return {
+        "drives": drives,
+        "diff_count": counts["diff"],
+        "full_count": counts["full"],
+        "pending_bhash_count": counts["pending_bhash"],
+        "omitted_base_parts": omitted_by_drive,
+        "summary_text": "\n".join(lines),
+    }
 
 
 class Handler:
@@ -351,8 +816,13 @@ class Handler:
         compression_format_combobox.set_active(0)
         self.compression_tool_changed(compression_format_combobox)
 
-        # SeekZilla: optional differential backup selection on the compression page
+        # SeekZilla v2.2: Backup Mode & Differential Base selection on Step 4
+        # (destination folder), refreshed whenever the folder scan completes.
         self._init_differential_backup_ui()
+        if hasattr(self.image_folder_query, "set_on_scan_complete_callback"):
+            self.image_folder_query.set_on_scan_complete_callback(
+                self._on_image_folder_scan_complete
+            )
 
         backup_ui_manager = GtkUiManager(
             builder=builder,
@@ -838,13 +1308,21 @@ class Handler:
                         self.handle_mount_local_or_remote()
                     )
                 elif self.current_page == Page.BACKUP_DESTINATION_FOLDER:
-                    enduser_date = (
-                        datetime.today().strftime("%Y-%m-%d-%H%M")
-                        + SEEKZILLA_FULL_FOLDER_SUFFIX
-                    )
-                    self.builder.get_object("backup_name").set_text(enduser_date)
-                    self.current_page = Page.BACKUP_IMAGE_NAME_SELECTION
-                    self.builder.get_object("backup_tabs").set_current_page(4)
+                    # SeekZilla v2.2: the backup mode is chosen on this page, so
+                    # Step 5 directly proposes the matching folder name.
+                    diff_selection, diff_error = self.get_differential_backup_selection()
+                    if diff_error is not None:
+                        ErrorMessageModalPopup(self.builder, diff_error)
+                    else:
+                        self.diff_selection = diff_selection
+                        enduser_date = datetime.today().strftime(
+                            "%Y-%m-%d-%H%M"
+                        ) + self.get_default_backup_folder_suffix(
+                            diff_selection is not None
+                        )
+                        self.builder.get_object("backup_name").set_text(enduser_date)
+                        self.current_page = Page.BACKUP_IMAGE_NAME_SELECTION
+                        self.builder.get_object("backup_tabs").set_current_page(4)
                 elif self.current_page == Page.BACKUP_IMAGE_NAME_SELECTION:
                     selected_directory = self.builder.get_object(
                         "backup_folder_label"
@@ -878,19 +1356,16 @@ class Handler:
                         ).get_text()
                         self.current_page = Page.BACKUP_COMPRESSION_CUSTOMIZATION
                         self.builder.get_object("backup_tabs").set_current_page(5)
-                        # Offer the full images in the destination folder as diff bases
-                        self.refresh_differential_base_images()
+                        # The differential base was chosen on Step 4; only warn here
+                        # when the chosen compression cannot produce a diff image.
+                        self._update_diff_compression_warning()
                 elif self.current_page == Page.BACKUP_COMPRESSION_CUSTOMIZATION:
-                    diff_selection, diff_error = self.get_differential_backup_selection()
-                    if diff_error is not None:
-                        ErrorMessageModalPopup(self.builder, diff_error)
-                    else:
-                        self.diff_selection = diff_selection
-                        self._apply_backup_mode_folder_name(diff_selection is not None)
-                        self.compression_dict = self.get_compression_dict()
-                        self.confirm_backup_configuration()
-                        self.current_page = Page.BACKUP_CONFIRM_CONFIGURATION
-                        self.builder.get_object("backup_tabs").set_current_page(6)
+                    # Backup mode + base were validated on Step 4 and the folder
+                    # name was proposed accordingly on Step 5 (never renamed here).
+                    self.compression_dict = self.get_compression_dict()
+                    self.confirm_backup_configuration()
+                    self.current_page = Page.BACKUP_CONFIRM_CONFIGURATION
+                    self.builder.get_object("backup_tabs").set_current_page(6)
                 elif self.current_page == Page.BACKUP_CONFIRM_CONFIGURATION:
                     self.current_page = Page.BACKUP_PROGRESS
                     self.builder.get_object("backup_tabs").set_current_page(7)
@@ -899,9 +1374,14 @@ class Handler:
                     diff_selection = getattr(self, "diff_selection", None)
                     diff_base_dirs_by_drive = None
                     if diff_selection is not None:
-                        diff_base_dirs_by_drive = dict(
-                            diff_selection.get("base_dirs_by_drive") or {}
-                        )
+                        drifted_set = set(diff_selection.get("drifted_drives") or ())
+                        diff_base_dirs_by_drive = {
+                            dk: path
+                            for dk, path in (
+                                diff_selection.get("base_dirs_by_drive") or {}
+                            ).items()
+                            if dk not in drifted_set
+                        }
                     if len(self.active_backup_drive_keys) > 1:
                         backup_jobs = [
                             (
@@ -925,7 +1405,13 @@ class Handler:
                         if diff_selection is not None:
                             diff_base_dir = (diff_base_dirs_by_drive or {}).get(
                                 self.selected_drive_key
-                            ) or diff_selection.get("base_dir")
+                            )
+                            if (
+                                diff_base_dir is None
+                                and self.selected_drive_key
+                                not in (diff_selection.get("drifted_drives") or {})
+                            ):
+                                diff_base_dir = diff_selection.get("base_dir")
                         self.backup_manager.start_backup(
                             self.selected_drive_key,
                             self.partitions_to_backup,
@@ -2331,83 +2817,293 @@ class Handler:
             self.image_folder_query.query_folder(text)
 
     # ------------------------------------------------------------------
-    # SeekZilla differential backup selection (compression page)
+    # SeekZilla v2.2: Backup Mode & Differential Base (Step 4)
     # ------------------------------------------------------------------
 
-    def _init_differential_backup_ui(self):
-        """Append the "Differential Backup (Optional)" frame to the compression page.
+    def _get_builder_object(self, name):
+        try:
+            return self.builder.get_object(name)
+        except Exception:
+            return None
 
-        Built programmatically (no Glade widget IDs change); silently skipped
-        when the container widget is absent (e.g. minimal test builders).
+    @staticmethod
+    def _insert_before_widget(container, widget, anchor):
+        """Move `widget` (already packed in `container`) right above `anchor`."""
+        if anchor is None or anchor.get_parent() is not container:
+            return
+        children = container.get_children()
+        if anchor in children:
+            container.reorder_child(widget, children.index(anchor))
+
+    def _init_differential_backup_ui(self):
+        """Inject the "Backup Mode & Differential Base" frame into Step 4.
+
+        Built programmatically inside `backup_step4_contentvbox`, right above
+        `backup_step4_when_ready_label` (no Glade edits / widget IDs change);
+        silently skipped when the container is absent (minimal test builders).
+        `self.diff_checkbutton` is the Differential radio button
+        (Gtk.RadioButton subclasses Gtk.CheckButton, so get_active() /
+        "toggled" keep working for existing callers).
         """
         self.diff_selection = None
         self.diff_base_candidates = []
         self.diff_custom_candidate = None
+        self.diff_custom_dir = None
         self.diff_checkbutton = None
+        self.diff_full_radiobutton = None
         self.diff_base_combobox = None
         self.diff_browse_button = None
+        self.diff_build_bhash_button = None
         self.diff_status_label = None
-        try:
-            container = self.builder.get_object("backup_step7_content_vbox2")
-        except Exception:
-            container = None
+        self.diff_preview_label = None
+        self.diff_preview_scrolled = None
+        self.diff_compression_warning_label = None
+        self.diff_bhash_build_in_progress = False
+        self._diff_last_parent_dir = None
+        self._init_diff_compression_warning_label()
+        container = self._get_builder_object("backup_step4_contentvbox")
         if container is None or not hasattr(container, "pack_start"):
             return
         try:
-            frame = Gtk.Frame(label=_("Differential Backup (Optional)"))
-            vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-            vbox.set_border_width(8)
-            checkbutton = Gtk.CheckButton(
-                label=_(
-                    "Differential backup against an existing full base image (only store changed 1 MiB blocks)"
-                )
+            frame = Gtk.Frame(label=_("Backup Mode & Differential Base"))
+            vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+            vbox.set_border_width(4)
+            radio_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+            radio_full = Gtk.RadioButton.new_with_label_from_widget(
+                None, _("Full Backup (standalone baseline)")
             )
+            radio_diff = Gtk.RadioButton.new_with_label_from_widget(
+                radio_full,
+                _("Differential Backup (changed 1 MiB blocks vs. base)"),
+            )
+            for radio in (radio_full, radio_diff):
+                child = radio.get_child()
+                if isinstance(child, Gtk.Label):
+                    child.set_xalign(0.0)
+            radio_full.set_active(True)
+            radio_row.pack_start(radio_full, False, False, 0)
+            radio_row.pack_start(radio_diff, False, False, 0)
+
             hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
             combobox = Gtk.ComboBoxText()
             combobox.set_hexpand(True)
+            # Long folder names must never widen the window past 1280 px.
+            for cell in combobox.get_cells():
+                cell.set_property("ellipsize", Pango.EllipsizeMode.END)
             browse_button = Gtk.Button(label=_("Browse..."))
+            build_button = Gtk.Button(label=_("Build Base Index (.rzbhash)..."))
+            build_button.set_tooltip_text(
+                _(
+                    "Read the selected full backup (read-only) and create the missing Info-bhash-<partition>.rzbhash index files next to it."
+                )
+            )
+            build_button.set_no_show_all(True)
             hbox.pack_start(combobox, True, True, 0)
             hbox.pack_start(browse_button, False, False, 0)
+            hbox.pack_start(build_button, False, False, 0)
+
             status_label = Gtk.Label()
             status_label.set_xalign(0.0)
             status_label.set_line_wrap(True)
-            vbox.pack_start(checkbutton, False, False, 0)
+            status_label.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+
+            preview_label = Gtk.Label()
+            preview_label.set_xalign(0.0)
+            preview_label.set_yalign(0.0)
+            preview_label.set_margin_start(4)
+            preview_label.set_margin_end(4)
+            viewport = Gtk.Viewport()
+            viewport.set_shadow_type(Gtk.ShadowType.NONE)
+            viewport.add(preview_label)
+            scrolled = Gtk.ScrolledWindow()
+            scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+            scrolled.set_shadow_type(Gtk.ShadowType.IN)
+            scrolled.set_min_content_height(110)
+            scrolled.set_max_content_height(136)
+            if hasattr(scrolled, "set_propagate_natural_height"):
+                scrolled.set_propagate_natural_height(True)
+            scrolled.add(viewport)
+            # Only shown while the Differential radio is active.
+            scrolled.set_no_show_all(True)
+            viewport.show()
+            preview_label.show()
+
+            vbox.pack_start(radio_row, False, False, 0)
             vbox.pack_start(hbox, False, False, 0)
             vbox.pack_start(status_label, False, False, 0)
+            vbox.pack_start(scrolled, True, True, 0)
             frame.add(vbox)
-            container.pack_start(frame, False, False, 6)
-            when_ready_label = self.builder.get_object("backup_step6_when_ready_label")
-            if when_ready_label is not None and when_ready_label.get_parent() is container:
-                children = container.get_children()
-                if when_ready_label in children:
-                    container.reorder_child(frame, children.index(when_ready_label))
-            checkbutton.connect("toggled", self._on_differential_toggled)
+            container.pack_start(frame, False, False, 2)
+            self._insert_before_widget(
+                container, frame, self._get_builder_object("backup_step4_when_ready_label")
+            )
+            self._compact_backup_step4_labels()
+
+            radio_diff.connect("toggled", self._on_differential_toggled)
             combobox.connect("changed", self._on_differential_base_changed)
             browse_button.connect("clicked", self._on_differential_browse_clicked)
+            build_button.connect("clicked", self._on_build_base_index_clicked)
             frame.show_all()
-            self.diff_checkbutton = checkbutton
+            self.diff_full_radiobutton = radio_full
+            self.diff_checkbutton = radio_diff
             self.diff_base_combobox = combobox
             self.diff_browse_button = browse_button
+            self.diff_build_bhash_button = build_button
             self.diff_status_label = status_label
+            self.diff_preview_label = preview_label
+            self.diff_preview_scrolled = scrolled
             self._update_differential_widgets()
         except Exception:
             traceback.print_exc()
+            self.diff_full_radiobutton = None
             self.diff_checkbutton = None
             self.diff_base_combobox = None
             self.diff_browse_button = None
+            self.diff_build_bhash_button = None
             self.diff_status_label = None
+            self.diff_preview_label = None
+            self.diff_preview_scrolled = None
+
+    def _compact_backup_step4_labels(self):
+        """Reduce the 20 px vertical padding and 15 px margins on Step 4.
+
+        Makes room for the Backup Mode frame and partition preview so the
+        entire page (including status, preview, and Back/Next buttons) fits
+        cleanly at 1280x720 (even minus titlebar and LXPanel).
+        """
+        for name in (
+            "backup_step4_text",
+            "backup_step4_text2",
+            "backup_step4_when_ready_label",
+        ):
+            label = self._get_builder_object(name)
+            if label is None or not hasattr(label, "set_padding"):
+                continue
+            try:
+                xpad, _ypad = label.get_padding()
+                label.set_padding(xpad, 2)
+            except Exception:
+                traceback.print_exc()
+        for name in (
+            "backup_step4_vbox",
+            "backup_step4_frame",
+            "backup_step4_contentvbox",
+        ):
+            widget = self._get_builder_object(name)
+            if widget is not None and hasattr(widget, "set_margin_bottom"):
+                try:
+                    widget.set_margin_bottom(4)
+                except Exception:
+                    traceback.print_exc()
+        treeview = self._get_builder_object(
+            "backup_step4_destination_folder_image_files_treeview"
+        )
+        self._diff_step4_images_scrolled = None
+        if treeview is not None and hasattr(treeview, "get_parent"):
+            try:
+                tree_scrolled = treeview.get_parent()
+                if tree_scrolled is not None:
+                    self._diff_step4_images_scrolled = tree_scrolled
+                    if hasattr(tree_scrolled, "set_margin_bottom"):
+                        tree_scrolled.set_margin_bottom(4)
+                    if hasattr(tree_scrolled, "set_size_request"):
+                        tree_scrolled.set_size_request(-1, 78)
+                    container = self._get_builder_object("backup_step4_contentvbox")
+                    if container is not None and hasattr(container, "child_set_property"):
+                        try:
+                            container.child_set_property(tree_scrolled, "expand", False)
+                        except Exception:
+                            pass
+            except Exception:
+                traceback.print_exc()
+
+    def _init_diff_compression_warning_label(self):
+        """Step 6 hint: differential backups need zstd or gzip compression."""
+        container = self._get_builder_object("backup_step7_content_vbox2")
+        if container is None or not hasattr(container, "pack_start"):
+            return
+        try:
+            label = Gtk.Label()
+            label.set_xalign(0.0)
+            label.set_line_wrap(True)
+            label.set_markup(
+                "<b>"
+                + GObject.markup_escape_text(
+                    _(
+                        "Differential Backup was selected on Step 4, but it requires zstd or gzip compression. With this compression format every partition is saved as a full image."
+                    )
+                )
+                + "</b>"
+            )
+            label.set_no_show_all(True)
+            container.pack_start(label, False, False, 6)
+            self._insert_before_widget(
+                container, label, self._get_builder_object("backup_step6_when_ready_label")
+            )
+            label.hide()
+            self.diff_compression_warning_label = label
+            combobox = self._get_builder_object("backup_step6_compression_format_combobox")
+            if combobox is not None and hasattr(combobox, "connect"):
+                combobox.connect(
+                    "changed", lambda _combo: self._update_diff_compression_warning()
+                )
+        except Exception:
+            traceback.print_exc()
+            self.diff_compression_warning_label = None
+
+    def _get_selected_compression_format(self):
+        combobox = self._get_builder_object("backup_step6_compression_format_combobox")
+        if combobox is None:
+            return None
+        try:
+            tree_iter = combobox.get_active_iter()
+            if tree_iter is None:
+                return None
+            return combobox.get_model()[tree_iter][0]
+        except Exception:
+            return None
+
+    def _update_diff_compression_warning(self):
+        label = getattr(self, "diff_compression_warning_label", None)
+        if label is None:
+            return
+        fmt = self._get_selected_compression_format()
+        label.set_visible(
+            getattr(self, "diff_selection", None) is not None
+            and fmt is not None
+            and fmt not in ("zstd", "gzip")
+        )
+
+    def get_default_backup_folder_suffix(self, is_differential):
+        return SEEKZILLA_DIFF_FOLDER_SUFFIX if is_differential else SEEKZILLA_FULL_FOLDER_SUFFIX
+
+    def _on_image_folder_scan_complete(self):
+        """ImageFolderQuery finished scanning (GTK main thread)."""
+        if self.mode == Mode.BACKUP:
+            self.refresh_differential_base_images()
+
+    def _set_differential_mode(self, is_differential):
+        if is_differential:
+            if self.diff_checkbutton is not None:
+                self.diff_checkbutton.set_active(True)
+        elif self.diff_full_radiobutton is not None:
+            # A radio button cannot be de-activated directly: activate Full.
+            self.diff_full_radiobutton.set_active(True)
+        elif self.diff_checkbutton is not None:
+            self.diff_checkbutton.set_active(False)
 
     def _reset_differential_backup_selection(self):
         self.diff_selection = None
         self.diff_custom_candidate = None
+        self.diff_custom_dir = None
         self.diff_base_candidates = []
-        checkbutton = getattr(self, "diff_checkbutton", None)
-        if checkbutton is not None:
-            checkbutton.set_active(False)
+        self._diff_last_parent_dir = None
+        self._set_differential_mode(False)
         combobox = getattr(self, "diff_base_combobox", None)
         if combobox is not None:
             combobox.remove_all()
         self._update_differential_widgets()
+        self._update_diff_compression_warning()
 
     def _get_backup_drive_keys(self):
         keys = list(getattr(self, "active_backup_drive_keys", None) or [])
@@ -2416,47 +3112,167 @@ class Handler:
         return keys
 
     def _get_backup_parent_dir(self):
-        parent_dir = getattr(self, "backup_parent_dir", None)
-        if parent_dir:
-            return parent_dir
-        label = self.builder.get_object("backup_folder_label")
-        return label.get_text() if label is not None else ""
+        # Step 4 shows (and lets the user change) the destination folder in
+        # backup_folder_label: it is authoritative over an older Step 5 value.
+        label = self._get_builder_object("backup_folder_label")
+        text = label.get_text() if label is not None else ""
+        if text:
+            return text
+        return getattr(self, "backup_parent_dir", None) or ""
 
-    def refresh_differential_base_images(self):
-        """Re-discover compatible base images in the destination folder."""
+    @staticmethod
+    def _candidate_identity(candidate):
+        if not candidate:
+            return None
+        dirs = candidate.get("base_dirs_by_drive") or {}
+        if dirs:
+            return tuple(sorted(os.path.normpath(p) for p in dirs.values()))
+        base_dir = candidate.get("base_dir")
+        return (os.path.normpath(base_dir),) if base_dir else None
+
+    def refresh_differential_base_images(self, preserve_selection=True):
+        """Re-discover base images (Ready and Needs-.rzbhash) in the destination folder.
+
+        Keeps the currently selected base folder selected when it is still
+        offered (e.g. after Build Base Index turned it from Needs -> Ready).
+        """
+        previous = None
+        if preserve_selection:
+            previous = self._candidate_identity(self._get_selected_differential_candidate())
+        parent_dir = self._get_backup_parent_dir()
+        prev_parent_dir = getattr(self, "_diff_last_parent_dir", None)
+        parent_changed = (
+            prev_parent_dir is not None
+            and parent_dir
+            and os.path.normpath(parent_dir) != os.path.normpath(prev_parent_dir)
+        )
+        self._diff_last_parent_dir = parent_dir
         drive_state = getattr(getattr(self, "drive_query", None), "drive_state", None) or {}
         try:
             candidates = discover_compatible_base_images(
-                self._get_backup_parent_dir(), self._get_backup_drive_keys(), drive_state
+                parent_dir,
+                self._get_backup_drive_keys(),
+                drive_state,
+                include_needs_bhash=True,
             )
         except Exception:
             traceback.print_exc()
             candidates = []
+        custom_dir = getattr(self, "diff_custom_dir", None)
+        if custom_dir:
+            # Re-inspect the browsed folder: its .rzbhash state may have changed.
+            custom = self._build_custom_base_candidate(custom_dir)
+            self.diff_custom_candidate = custom
+            if custom is None:
+                self.diff_custom_dir = None
         custom = getattr(self, "diff_custom_candidate", None)
         if custom is not None:
+            custom_id = self._candidate_identity(custom)
             candidates = [custom] + [
-                c for c in candidates if c.get("base_dir") != custom.get("base_dir")
+                c for c in candidates if self._candidate_identity(c) != custom_id
             ]
         self.diff_base_candidates = candidates
         combobox = getattr(self, "diff_base_combobox", None)
+        matched_previous = False
         if combobox is not None:
             combobox.remove_all()
             for candidate in candidates:
                 combobox.append_text(candidate["label"])
             if candidates:
-                combobox.set_active(0)
+                index = 0
+                if previous is not None:
+                    for i, candidate in enumerate(candidates):
+                        if self._candidate_identity(candidate) == previous:
+                            index = i
+                            matched_previous = True
+                            break
+                combobox.set_active(index)
+        if (
+            parent_changed
+            and previous is not None
+            and not matched_previous
+            and custom is None
+            and self.diff_checkbutton is not None
+            and self.diff_checkbutton.get_active()
+        ):
+            # User moved to a different folder where the prior base doesn't exist:
+            # avoid silently switching to an unrelated base.
+            self._set_differential_mode(False)
         self._update_differential_widgets()
+
+    def _get_selected_differential_candidate(self):
+        candidates = getattr(self, "diff_base_candidates", None) or []
+        combobox = getattr(self, "diff_base_combobox", None)
+        index = combobox.get_active() if combobox is not None else -1
+        if index is None or index < 0 or index >= len(candidates):
+            return None
+        return candidates[index]
+
+    def get_differential_partition_preview(self, candidate=None):
+        """build_differential_partition_preview() for the current Step 2 selection."""
+        if candidate is None:
+            candidate = self._get_selected_differential_candidate()
+        return build_differential_partition_preview(
+            self._get_backup_drive_keys(),
+            getattr(self, "partitions_to_backup_by_drive", None) or {},
+            candidate,
+        )
+
+    @staticmethod
+    def _format_bytes(num_bytes):
+        try:
+            return Utility.human_readable_filesize(int(num_bytes))
+        except Exception:
+            return str(num_bytes) + " B"
 
     def _update_differential_widgets(self):
         checkbutton = getattr(self, "diff_checkbutton", None)
         if checkbutton is None:
             return
         is_active = checkbutton.get_active()
+        building = bool(getattr(self, "diff_bhash_build_in_progress", False))
         candidates = getattr(self, "diff_base_candidates", None) or []
+        candidate = self._get_selected_differential_candidate() if is_active else None
         if self.diff_base_combobox is not None:
-            self.diff_base_combobox.set_sensitive(is_active and len(candidates) > 0)
+            self.diff_base_combobox.set_sensitive(
+                is_active and len(candidates) > 0 and not building
+            )
         if self.diff_browse_button is not None:
-            self.diff_browse_button.set_sensitive(is_active)
+            self.diff_browse_button.set_sensitive(is_active and not building)
+        build_button = getattr(self, "diff_build_bhash_button", None)
+        if build_button is not None:
+            show_build = bool(is_active and candidate and candidate.get("needs_bhash"))
+            build_button.set_visible(show_build)
+            build_button.set_sensitive(show_build and not building)
+        scrolled = getattr(self, "diff_preview_scrolled", None)
+        if scrolled is not None:
+            scrolled.set_visible(is_active)
+        # In Differential mode, collapse the static read-only existing-images
+        # table so the active base selector + per-partition preview occupy that
+        # space cleanly without scrolling or clipping on 1280x720 screens.
+        for name in ("backup_step4_text2", "backup_step4_when_ready_label"):
+            w = self._get_builder_object(name)
+            if w is not None and hasattr(w, "set_visible"):
+                w.set_visible(not is_active)
+        tree_scrolled = getattr(self, "_diff_step4_images_scrolled", None)
+        if tree_scrolled is not None and hasattr(tree_scrolled, "set_visible"):
+            tree_scrolled.set_visible(not is_active)
+        preview = None
+        if is_active:
+            try:
+                preview = self.get_differential_partition_preview(candidate)
+            except Exception:
+                traceback.print_exc()
+                preview = None
+            preview_label = getattr(self, "diff_preview_label", None)
+            if preview_label is not None:
+                preview_label.set_markup(
+                    "<tt>"
+                    + GObject.markup_escape_text(
+                        preview["summary_text"] if preview else ""
+                    )
+                    + "</tt>"
+                )
         if self.diff_status_label is None:
             return
         if not is_active:
@@ -2465,19 +3281,58 @@ class Handler:
             )
         elif not candidates:
             text = _(
-                "No compatible full base image (with .rzbhash) found in {folder}. Use Browse... to select one."
+                "No full backup for the selected drive(s) was found in {folder}. Use Browse... to select one, or choose Full Backup."
             ).format(folder=self._get_backup_parent_dir())
+        elif candidate is None:
+            text = _("Select the full backup to use as the differential base.")
         else:
-            selection, _error = self.get_differential_backup_selection()
-            text = ""
-            if selection is not None and selection.get("missing_drives"):
-                text = _(
-                    "No base image for: {drives} (these drives get a full backup)."
-                ).format(drives=", ".join(selection["missing_drives"]))
-            if not text:
-                text = _(
-                    "Partitions that are incompatible with the base (resized, other filesystem, partclone.dd) are saved as full images automatically."
+            notes = []
+            if candidate.get("all_drifted"):
+                drifted_map = ", ".join(
+                    "{old} -> {new}".format(old=old or "?", new=dk)
+                    for dk, old in (candidate.get("drifted_drives") or {}).items()
                 )
+                notes.append(
+                    _(
+                        "Cannot use for differential backup: drive device name changed ({mapping}). Choose Full Backup, or reboot if your drives enumerated in a different order."
+                    ).format(mapping=drifted_map)
+                )
+            elif not candidate.get("has_any_bhash", True):
+                notes.append(
+                    _(
+                        "This backup has no .rzbhash index yet: click 'Build Base Index (.rzbhash)...' (read-only on the original backup), or choose Full Backup."
+                    )
+                )
+            elif candidate.get("needs_bhash"):
+                notes.append(
+                    _(
+                        "{count} partition(s) of this base have no .rzbhash index yet ({size} to read). Click 'Build Base Index (.rzbhash)...' to index them, otherwise they are saved as full."
+                    ).format(
+                        count=candidate.get("missing_bhash_count", 0),
+                        size=self._format_bytes(candidate.get("missing_bhash_bytes", 0)),
+                    )
+                )
+            elif preview is not None:
+                notes.append(
+                    _("Ready: {diff} partition(s) differential, {full} full.").format(
+                        diff=preview["diff_count"], full=preview["full_count"]
+                    )
+                )
+            if candidate.get("missing_drives"):
+                notes.append(
+                    _(
+                        "No base image for: {drives} (these drives get a full backup)."
+                    ).format(drives=", ".join(candidate["missing_drives"]))
+                )
+            if candidate.get("device_name_drifted") and not candidate.get("all_drifted"):
+                notes.append(
+                    _(
+                        "Drive name changed since this base was saved for some drive(s); affected drives will be saved as full."
+                    )
+                )
+            text = " ".join(notes) or _(
+                "Partitions that are incompatible with the base (resized, other filesystem, partclone.dd) are saved as full images automatically."
+            )
         self.diff_status_label.set_text(text)
 
     def _on_differential_toggled(self, toggle_button):
@@ -2488,6 +3343,262 @@ class Handler:
     def _on_differential_base_changed(self, combobox):
         self._update_differential_widgets()
 
+    # ------------------------------------------------------------------
+    # Live "Build Base Index (.rzbhash)..." (background thread)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def collect_missing_bhash_work(candidate):
+        """Ordered, de-duplicated [(drive_key, base_dir, PtclImageSet), ...]."""
+        work = []
+        seen = set()
+        for dk, items in ((candidate or {}).get("missing_bhash_by_drive") or {}).items():
+            for base_dir, images in items or []:
+                for img in images or []:
+                    key = (os.path.normpath(base_dir), img.short_part)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    work.append((dk, base_dir, img))
+        return work
+
+    def _on_build_base_index_clicked(self, button):
+        if getattr(self, "diff_bhash_build_in_progress", False):
+            return
+        candidate = self._get_selected_differential_candidate()
+        work = self.collect_missing_bhash_work(candidate)
+        if not work:
+            self._update_differential_widgets()
+            return
+        base_dirs = []
+        for _dk, base_dir, _img in work:
+            if base_dir not in base_dirs:
+                base_dirs.append(base_dir)
+        read_only = [d for d in base_dirs if not os.access(d, os.W_OK | os.X_OK)]
+        if read_only:
+            ErrorMessageModalPopup(
+                self.builder,
+                _(
+                    "Cannot create the .rzbhash index: the base backup folder is read-only (or not writable):\n\n{folders}\n\nNothing was changed. Choose Full Backup, or a base backup on a writable drive."
+                ).format(folders="\n".join(read_only)),
+            )
+            return
+        total_bytes = 0
+        for _dk, _base_dir, img in work:
+            for path in img.split_paths:
+                try:
+                    total_bytes += os.path.getsize(path)
+                except OSError:
+                    pass
+        message = _(
+            "Build the differential base index for {count} partition(s) ({size} of backup data to read) in:\n\n{folders}\n\nOriginal backup split files are opened read-only and never modified. Only Info-bhash-<part>.rzbhash sidecar files will be created."
+        ).format(
+            count=len(work),
+            size=self._format_bytes(total_bytes),
+            folders="\n".join(base_dirs),
+        )
+        dialog = Gtk.MessageDialog(
+            transient_for=self._get_builder_object("main_window"),
+            modal=True,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text=_("Build Base Index (.rzbhash)?"),
+        )
+        dialog.format_secondary_text(message)
+        try:
+            response = dialog.run()
+        finally:
+            dialog.destroy()
+        if response != Gtk.ResponseType.OK:
+            return
+        self._start_bhash_build(work, total_bytes)
+
+    def _start_bhash_build(self, work, total_bytes):
+        cancel_event = threading.Event()
+        state = {
+            "work": work,
+            "total_bytes": max(int(total_bytes), 1),
+            "done_before": 0,
+            "start": time.monotonic(),
+            "cancel_event": cancel_event,
+            "built": [],
+            "skipped": [],
+            "errors": [],
+            "cancelled": False,
+            "selection_id": self._candidate_identity(
+                self._get_selected_differential_candidate()
+            ),
+        }
+        dialog = Gtk.Dialog(
+            title=_("Building differential base index (.rzbhash)"),
+            transient_for=self._get_builder_object("main_window"),
+            modal=True,
+        )
+        dialog.set_default_size(560, -1)
+        dialog.set_deletable(False)
+        cancel_button = dialog.add_button(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL)
+        box = dialog.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(12)
+        part_label = Gtk.Label(label=_("Preparing…"))
+        part_label.set_xalign(0.0)
+        part_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        progress_bar = Gtk.ProgressBar()
+        progress_bar.set_show_text(True)
+        stats_label = Gtk.Label(label="")
+        stats_label.set_xalign(0.0)
+        note_label = Gtk.Label(
+            label=_("Original backup files are only read, never modified.")
+        )
+        note_label.set_xalign(0.0)
+        for widget in (part_label, progress_bar, stats_label, note_label):
+            box.pack_start(widget, False, False, 0)
+        state.update(
+            dialog=dialog,
+            part_label=part_label,
+            progress_bar=progress_bar,
+            stats_label=stats_label,
+            cancel_button=cancel_button,
+        )
+
+        def _request_cancel(*_args):
+            if not cancel_event.is_set():
+                cancel_event.set()
+                part_label.set_text(_("Cancelling… (finishing the current block)"))
+                cancel_button.set_sensitive(False)
+            return True  # keep the dialog until the worker has stopped
+
+        dialog.connect("response", _request_cancel)
+        dialog.connect("delete-event", _request_cancel)
+        dialog.show_all()
+        self._diff_bhash_build_state = state
+        self.diff_bhash_build_in_progress = True
+        self._update_differential_widgets()
+        thread = threading.Thread(
+            target=self._bhash_build_worker, args=(state,), name="rzbhash-build"
+        )
+        thread.daemon = True
+        state["thread"] = thread
+        thread.start()
+
+    def _bhash_build_worker(self, state):
+        """Background thread: never touches GTK, only queues GLib.idle_add updates."""
+        work = state["work"]
+        cancel_event = state["cancel_event"]
+        total = len(work)
+        try:
+            for i, (_dk, base_dir, img) in enumerate(work, start=1):
+                if cancel_event.is_set():
+                    state["cancelled"] = True
+                    break
+                title = "[{i}/{n}] {part} ({fs})".format(
+                    i=i, n=total, part=img.short_part, fs=img.fs
+                )
+                part_bytes = 0
+                for path in img.split_paths:
+                    try:
+                        part_bytes += os.path.getsize(path)
+                    except OSError:
+                        pass
+                base_done = state["done_before"]
+                GLib.idle_add(self._bhash_build_progress_ui, state, title, 0, base_done)
+                out_path = os.path.join(base_dir, block_hash.bhash_index_filename(img.short_part))
+                seekidx = os.path.join(base_dir, "Info-seekidx-" + img.short_part + ".rzidx")
+
+                def _progress(done, _total, _decompressed, _title=title, _base=base_done):
+                    GLib.idle_add(self._bhash_build_progress_ui, state, _title, int(done), _base)
+
+                try:
+                    idx = block_hash.build_bhash_from_splits(
+                        img.split_paths,
+                        img.compression,
+                        out_path,
+                        seekidx_path=seekidx if os.path.isfile(seekidx) else None,
+                        progress_cb=_progress,
+                        cancel_event=cancel_event,
+                    )
+                except block_hash.BhashBuildCancelledError:
+                    state["cancelled"] = True
+                    break
+                except Exception as exc:
+                    traceback.print_exc()
+                    state["errors"].append("{part}: {err}".format(part=img.short_part, err=exc))
+                else:
+                    if idx is None:
+                        state["skipped"].append(img.short_part)
+                    else:
+                        state["built"].append(img.short_part)
+                state["done_before"] = base_done + part_bytes
+        except Exception as exc:
+            traceback.print_exc()
+            state["errors"].append(str(exc))
+        finally:
+            # Always close the dialog / re-enable the UI, whatever happened.
+            GLib.idle_add(self._on_bhash_build_finished, state)
+
+    def _bhash_build_progress_ui(self, state, title, current_done, done_before=0):
+        """GTK main thread: refresh the progress dialog."""
+        if state.get("finished"):
+            return False
+        done = int(done_before) + max(0, int(current_done))
+        total = state["total_bytes"]
+        fraction = min(1.0, done / float(total))
+        elapsed = max(time.monotonic() - state["start"], 1e-6)
+        rate = done / elapsed
+        if not state["cancel_event"].is_set():
+            state["part_label"].set_text(title)
+        state["progress_bar"].set_fraction(fraction)
+        state["progress_bar"].set_text("{:.0f}%".format(fraction * 100.0))
+        eta = (total - done) / rate if rate > 0 else 0
+        state["stats_label"].set_text(
+            _("{done} / {total} read · {rate:.1f} MB/s · ETA {eta}").format(
+                done=self._format_bytes(done),
+                total=self._format_bytes(total),
+                rate=rate / 1e6,
+                eta="{:d}:{:02d}".format(int(eta) // 60, int(eta) % 60),
+            )
+        )
+        return False
+
+    def _on_bhash_build_finished(self, state):
+        """GTK main thread: close the dialog, refresh candidates + preview."""
+        state["finished"] = True
+        self.diff_bhash_build_in_progress = False
+        dialog = state.get("dialog")
+        if dialog is not None:
+            dialog.destroy()
+        # Re-select the same base (now [Ready]) and refresh the preview.
+        self.refresh_differential_base_images(preserve_selection=True)
+        selection_id = state.get("selection_id")
+        combobox = getattr(self, "diff_base_combobox", None)
+        if selection_id is not None and combobox is not None:
+            for i, candidate in enumerate(self.diff_base_candidates or []):
+                if self._candidate_identity(candidate) == selection_id:
+                    combobox.set_active(i)
+                    break
+        self._update_differential_widgets()
+        summary = _("Built {built} .rzbhash index file(s).").format(built=len(state["built"]))
+        if state["skipped"]:
+            summary += " " + _("Skipped (not Partclone v0002): {parts}.").format(
+                parts=", ".join(state["skipped"])
+            )
+        if state["cancelled"]:
+            summary += " " + _("Cancelled: the remaining partitions were not indexed.")
+        if state["errors"]:
+            ErrorMessageModalPopup(
+                self.builder,
+                summary
+                + "\n\n"
+                + _("Errors (these partitions will be saved as full):")
+                + "\n"
+                + "\n".join(state["errors"]),
+            )
+        elif self.diff_status_label is not None:
+            self.diff_status_label.set_text(
+                summary + " " + self.diff_status_label.get_text()
+            )
+        return False
+
     def _build_custom_base_candidate(self, chosen_dir):
         """Candidate dict for a user-chosen base folder, or None if it is unusable."""
         if not chosen_dir or not os.path.isdir(chosen_dir):
@@ -2496,7 +3607,9 @@ class Handler:
         drive_state = getattr(getattr(self, "drive_query", None), "drive_state", None) or {}
         parent_dir = os.path.dirname(os.path.normpath(chosen_dir))
         try:
-            discovered = discover_compatible_base_images(parent_dir, drive_keys, drive_state)
+            discovered = discover_compatible_base_images(
+                parent_dir, drive_keys, drive_state, include_needs_bhash=True
+            )
         except Exception:
             traceback.print_exc()
             discovered = []
@@ -2510,21 +3623,52 @@ class Handler:
             entries = os.listdir(chosen_dir)
         except OSError:
             return None
-        if "Info-rzdiff-manifest.json" in entries:
+        if block_hash.is_differential_backup_dir_entries(entries):
+            return None  # differential (or partial differential) backups are never a base
+        status = block_hash.inspect_base_dir_bhash_status(chosen_dir)
+        has_bhash_file = any(
+            e.startswith("Info-bhash-") and e.endswith(".rzbhash") for e in entries
+        )
+        if not status["ptcl_parts"] and not has_bhash_file:
             return None
-        if not any(e.startswith("Info-bhash-") and e.endswith(".rzbhash") for e in entries):
-            return None
+        has_any_bhash = bool(status["bhash_parts"]) if status["ptcl_parts"] else has_bhash_file
+        needs = bool(status["missing_images"])
+        name = os.path.basename(norm_chosen)
+        state_text = _("Ready") if (has_any_bhash and not needs) else _("Needs .rzbhash index")
         # Not matched to a drive by name/disk file: offer it to every drive;
         # partitions without a matching .rzbhash fall back to full backups.
+        # Record missing images for every selected drive so per-drive previews
+        # reflect invalid/missing .rzbhash accurately (collect_missing_bhash_work
+        # deduplicates by (base_dir, short_part)).
+        missing_by_drive = {}
+        if needs and drive_keys:
+            for dk in drive_keys:
+                missing_by_drive[dk] = [(chosen_dir, list(status["missing_images"]))]
         return {
-            "label": os.path.basename(norm_chosen) + " " + _("(selected)"),
-            "name": os.path.basename(norm_chosen),
+            "label": "{name}  [{state}] {selected}".format(
+                name=name, state=state_text, selected=_("(selected)")
+            ),
+            "name": name,
             "base_dir": chosen_dir,
             "base_dirs_by_drive": {dk: chosen_dir for dk in drive_keys},
             "missing_drives": [],
             "matched_partitions": {},
             "is_multi_drive": len(drive_keys) > 1,
             "mtime": 0.0,
+            "has_any_bhash": has_any_bhash,
+            "needs_bhash": needs,
+            "fully_indexed": not needs,
+            "ready": has_any_bhash and not needs,
+            "missing_bhash_by_drive": missing_by_drive,
+            "missing_bhash_count": len(status["missing_images"]),
+            "missing_bhash_bytes": int(status["total_missing_compressed_bytes"]),
+            "device_name_drifted": False,
+            "all_drifted": False,
+            "drifted_drives": {},
+            "base_parts_by_drive": {
+                dk: sorted(set(status["ptcl_parts"]) | set(status["bhash_parts"]))
+                for dk in drive_keys
+            },
         }
 
     def _on_differential_browse_clicked(self, button):
@@ -2552,31 +3696,47 @@ class Handler:
             ErrorMessageModalPopup(
                 self.builder,
                 _(
-                    "The selected folder cannot be used as a differential base: {folder}\n\nA base must be a full SeekZilla backup containing Info-bhash-*.rzbhash files (and must not be a differential backup itself)."
+                    "The selected folder cannot be used as a differential base: {folder}\n\nA base must be a full Rescuezilla / Clonezilla / SeekZilla backup containing Partclone images (.gz, .zst or .uncomp split files) and must not be a differential backup itself."
                 ).format(folder=chosen_dir),
             )
             return
+        self.diff_custom_dir = chosen_dir
         self.diff_custom_candidate = candidate
-        self.refresh_differential_base_images()
-        if self.diff_checkbutton is not None:
-            self.diff_checkbutton.set_active(True)
+        self._set_differential_mode(True)
+        self.refresh_differential_base_images(preserve_selection=False)
         if self.diff_base_combobox is not None and self.diff_base_candidates:
             self.diff_base_combobox.set_active(0)
         self._update_differential_widgets()
 
     def get_differential_backup_selection(self):
-        """Return (candidate_dict_or_None, error_message_or_None)."""
+        """Return (candidate_dict_or_None, error_message_or_None).
+
+        Full Backup -> (None, None). Differential -> the selected candidate, or
+        an actionable error when no base is selected or the base has no
+        `.rzbhash` at all yet (a partially indexed base is allowed: its
+        unindexed partitions are saved as full, as shown in the preview).
+        """
         checkbutton = getattr(self, "diff_checkbutton", None)
         if checkbutton is None or not checkbutton.get_active():
             return None, None
-        candidates = getattr(self, "diff_base_candidates", None) or []
-        combobox = getattr(self, "diff_base_combobox", None)
-        index = combobox.get_active() if combobox is not None else -1
-        if not candidates or index is None or index < 0 or index >= len(candidates):
+        candidate = self._get_selected_differential_candidate()
+        if candidate is None:
             return None, _(
-                "Differential backup is enabled, but no base image is selected.\n\nSelect a full SeekZilla backup (with .rzbhash files) using Browse..., or untick the differential backup option."
+                "Differential Backup is selected, but no full base backup is selected.\n\nSelect a full backup from the list (or use Browse...), or choose Full Backup."
             )
-        return candidates[index], None
+        if candidate.get("all_drifted"):
+            drifted_map = ", ".join(
+                "{old} -> {new}".format(old=old or "?", new=dk)
+                for dk, old in (candidate.get("drifted_drives") or {}).items()
+            )
+            return None, _(
+                "This backup was saved when the drive had a different device name ({mapping}).\n\nDifferential backup requires matching partition names. Choose Full Backup, or reboot if your drives enumerated in a different order."
+            ).format(mapping=drifted_map)
+        if not candidate.get("has_any_bhash", True):
+            return None, _(
+                "The selected backup does not have a differential base index (Info-bhash-*.rzbhash) yet.\n\nClick 'Build Base Index (.rzbhash)...' on this screen to generate it now (read-only on your original backup), or choose Full Backup."
+            )
+        return candidate, None
 
     def _apply_backup_mode_folder_name(self, is_differential):
         """Use "-diff-seekzilla" instead of the default "-img-seekzilla" folder suffix."""
@@ -2634,6 +3794,20 @@ class Handler:
                     "Differential backup requires zstd or gzip compression; partitions will be saved as full images."
                 )
             )
+        else:
+            try:
+                preview = self.get_differential_partition_preview(selection)
+            except Exception:
+                traceback.print_exc()
+                preview = None
+            if preview is not None:
+                text += (
+                    "\n<b>"
+                    + GObject.markup_escape_text(_("Per-partition plan:"))
+                    + "</b>\n<tt>"
+                    + GObject.markup_escape_text(preview["summary_text"])
+                    + "</tt>"
+                )
         return text
 
     def confirm_backup_configuration(self):

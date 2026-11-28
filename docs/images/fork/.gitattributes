@@ -1,0 +1,3 @@
+# Store fork README diagrams and screenshots as regular Git binary objects
+# so GitHub always renders them directly without Git LFS bandwidth limits.
+*.png -filter -diff -merge -text

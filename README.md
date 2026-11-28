@@ -1,28 +1,34 @@
 [![Rescuezilla banner](docs/images/banner.big.png)](https://rescuezilla.com)
 
-# Rescuezilla — Seekable Index & Multi-Disk Fork (`v1.1`)
+# SeekZilla（瞬尋救援龍）— Seekable Index, Multi-Disk & Hybrid Differential Backup (`v2.0`)
 
-> **非官方衍生分支聲明（GPL-3.0-or-later）**：本專案為 [rescuezilla/rescuezilla](https://github.com/rescuezilla/rescuezilla) 的社群衍生分支（分支 `feature/seekable-index`，最新定版標籤 [`2.6.2-seekable-multidisk-v1.1`](https://github.com/swho/rescuezilla/releases/tag/2.6.2-seekable-multidisk-v1.1)），與官方 Rescuezilla 專案無隸屬或背書關係。所有修改均依 **GNU GPL v3.0 or later** 釋出，詳細修改紀錄與實測證據請見 [`FORK_NOTES.md`](FORK_NOTES.md)。
+> **非官方衍生分支聲明（GPL-3.0-or-later）**：**SeekZilla** 為 [rescuezilla/rescuezilla](https://github.com/rescuezilla/rescuezilla) 的社群衍生分支（分支 `feature/seekable-index`，最新定版標籤 [`2.7.0-seekzilla-v2.0`](https://github.com/swho/rescuezilla/releases/tag/2.7.0-seekzilla-v2.0)），與官方 Rescuezilla 專案無隸屬或背書關係。所有修改與全新設計視覺素材均依 **GNU GPL v3.0 or later** 釋出，詳細修改紀錄與實測證據請見 [`FORK_NOTES.md`](FORK_NOTES.md)。
 
 ---
 
-## 本 Fork 多做了什麼？（與官方原版差異總覽）
+## SeekZilla 多做了什麼？（與官方原版 Rescuezilla 差異總覽）
 
-官方 Rescuezilla 備份單顆硬碟與整碟還原非常穩定，但在處理 **TB 級系統備份**與**多顆 NVMe 同時備份**時有兩個核心痛點：
+官方 Rescuezilla 備份單顆硬碟與整碟還原非常穩定，但在處理 **TB 級系統定期備份**與**多顆 NVMe 同時備份**時有三個核心痛點：
 1. **壓縮映像無法快速單檔還原**：傳統單一串流 `.gz` / `.zst` 必須從頭線性解壓數百 GB 才能讀到檔案，官方亦標註 10 GB 以上壓縮映像瀏覽「慢到無法使用」。
 2. **一次只能備份一顆磁碟**：擁有多顆硬碟時，必須守在電腦前等第一顆備份數小時結束，再手動重走一次精靈流程。
+3. **每次都得重新寫入數百 GB 完整備份**：日常僅異動少數檔案，卻沒有基準點差異備份機制。
 
-本 Fork 在 **100% 維持官方 Rescuezilla / Clonezilla 還原格式相容** 的前提下，新增以下能力：
+**SeekZilla (`v2.0`)** 在 **完整備份（Base）維持 100% 官方 Rescuezilla / Clonezilla 還原格式相容** 的前提下，新增以下能力：
 
-| 功能項目 | 官方原版 Rescuezilla | 本 Fork (`v1.1`) |
+| 功能項目 | 官方原版 Rescuezilla | SeekZilla (`v2.0`) |
 |---|---|---|
 | **隨機存取索引（`.rzidx`）** | 無（需 `O(N)` 整包線性解壓，常耗時數十分鐘～數小時） | **備份時同步原子寫入 `Info-seekidx-<part>.rzidx`**，支援 `O(1)` 毫秒級定位單幀（實測 1.18 TiB 實體備份 **0.000s～0.543s** 瞬開） |
+| **混合區塊級差異備份（`.rzbhash` + `rzdiff`）** | 無（每次皆需重寫整顆磁碟完整備份） | **Base 完整備份同步產出 1 MiB LBA SHA-256 雜湊索引（`.rzbhash`）**；後續差異備份僅儲存異動區塊（Depth-1，**永不修改 Base**），支援直接整碟還原、`partclone.chkimg` 校驗、一鍵 `merge` 合併回原版獨立完整映像、以及免解壓瞬開單檔瀏覽 |
+| **舊版完整備份事後補建索引** | 無 | 內建離線唯讀工具 **`block_hash.py build-from-image`**，可將既有 v1.0 / v1.1 完整備份補建 `.rzbhash` 直接升級為差異基準 |
 | **多磁碟一次備份** | Step 1 僅能單選 1 顆硬碟 | **Step 1 新增 `Backup` 勾選欄**，可一次勾選多顆硬碟，依序輸出為各自獨立標準目錄 `<基礎名稱>-<磁碟>`（單選維持原名無後綴） |
 | **壓縮引擎與預設格式** | 預設 `gzip -6`（`pigz`） | **預設 `zstd -3` 原生 `libzstd.so.1`（4 MiB 獨立幀 + XXH64）**；`gzip -6` 亦導入原生 **`libdeflate.so.0`（1 MiB 獨立幀）**，並依可用核心與 RAM/CCtx 自動解鎖全核心 |
-| **管線可靠性與取消保護** | 上游存在 3-process pipe 死鎖風險；取消 `os-prober` 可能殘留 FUSE `grub-mount` | **修復上游 3-process pipe 死鎖**；取消時立即終止子行程與脫離的 `grub-mount` 零殘留；分區失敗不寫 `Info-img-id.txt` 並清殘檔；成功時寫入壓縮遙測至 `clonezilla-img` |
-| **格式相容性** | 標準 Clonezilla 映像 | **100% 產出標準 RFC 8878 `.zst.*` / RFC 1952 `.gz.*` 分割檔**，`Info-*` 命名避開原版還原 glob，官方 Rescuezilla / Clonezilla 可直接還原 |
+| **開機與介面視覺識別** | Rescuezilla 傳統介面 | 全新 **SeekZilla** 深海藍（`#0F172A`）+ 電光青（`#38BDF8`）向量視覺（GRUB 開機選單、Plymouth 開機動畫、Live 桌面桌布、GTK 橫幅與圖示、Openbox 自動最大化），並保留完整 `Based on Rescuezilla (GPLv3)` 標示 |
+| **格式相容性** | 標準 Clonezilla 映像 | **完整備份（Base）與 `merge` 合併後映像 100% 產出標準 RFC 8878 `.zst.*` / RFC 1952 `.gz.*` 分割檔**，官方 Rescuezilla / Clonezilla 可直接還原 |
 
-> **相容性提醒**：官方 Rescuezilla 內建的舊版 Image Explorer 僅支援 `gzip`、`xz` 與 `uncompressed`。若使用本版預設 `zstd` 備份並欲瀏覽單檔，請搭配支援 `.rzidx` 的唯讀瀏覽工具（如 `rescuezilla-browser`）；若需相容舊版內建 Image Explorer 或 2020 年前的舊版 Clonezilla，於 Step 6 下拉改選 **`gzip`** 即可（同樣具備 `libdeflate` 多核加速與 `.rzidx` 索引）。
+> **相容性提醒**：
+> - **完整備份（Base）**：與官方 Rescuezilla / Clonezilla 100% 相容（`Info-seekidx-*.rzidx` 與 `Info-bhash-*.rzbhash` 皆以 `Info-*` 命名避開原版還原 glob）。
+> - **差異備份（`rzdiff`）**：與 Base 為配對關係（`README-RZDIFF.txt` 有完整說明），請保留同層目錄的 Base 映像勿更動；還原／校驗時全程 fail-closed 核對 Base 每塊 SHA-256（任何 1-bit 損毀即拒絕還原）。若需交給原版 Rescuezilla / Clonezilla 獨立使用，執行 `diff_synthesizer.py merge` 即可無損合併回獨立完整映像。
+> - 官方內建舊版 Image Explorer 僅支援 `gzip` / `xz` / `uncompressed` 完整備份；瀏覽 `zstd` 與 `rzdiff` 差異備份請搭配 **`SeekZilla Browser`**（`rescuezilla-browser`），或於 Step 6 選用 `gzip` 完整備份。
 
 ---
 
@@ -47,7 +53,7 @@
 | **Ubuntu 24.04 Noble（6 核容器，64 MiB 真實系統執行檔語料）** | 舊 `zlib1g gzip -6 (8t, 1M)`：`189.5 MB/s` (41.24%) → 新 `libdeflate gzip -6 (auto, 1M)`：**`727.3 MB/s` (3.84×, 40.91%)** → 新預設 `libzstd zstd -3 (auto, 4M)`：**`1,745.6 MB/s` (9.21×, 39.66%)** |
 | **VMware Live ISO 實機（2 vCPU / 2 GiB RAM，64 MiB 語料）** | 舊 `zlib1g`：`73.8 MB/s` (39.84%) → 新 `libdeflate`：**`243.6 MB/s` (3.30×, 39.25%)** → 新預設 `libzstd 4M`：**`715.9 MB/s` (9.70×, 33.70%)** |
 | **實體雙 NVMe 裸機多磁碟備份稽核（i9-13980HX，2.271 TiB → 1.153 TiB）** | 9 個分區全數 `Partclone exit code: 0`、`Info-img-id.txt` SHA-512 100% 吻合、抽樣解壓 496 個 frame（含全部 314 個跨 4 GB split 邊界幀）**0 錯誤**；全部 8 個可瀏覽分區透過 `.rzidx` 於 **0.000s～0.543s** 瞬開 |
-| **自動化單元測試與 Live E2E** | Noble Docker 單元測試 **65 / 65 通過**（`ruff` 0 錯誤）；Live ISO 實機 4 MiB `zstd` 與 1 MiB `libdeflate` `gzip` 備份均通過 `zstd -t` / XXH64 / `gzip -t` / CRC32 與 `rescuezilla-browser` 100% SHA-256 復原驗證 |
+| **自動化單元測試與 Live E2E (`v2.0`)** | Noble Docker 單元測試 **137 / 137 通過** + `SeekZilla Browser` **181 / 181 通過**（`ruff` 0 錯誤）；VMware Live ISO 實機完成 FAT32 / Btrfs / NTFS Full Base → V2 異動 → 差異備份（大小僅為 Base 的 **8.8%**、Base 零異動）→ `VerifyManager` (`partclone.chkimg`) → 1-bit 基準損毀阻斷（exit `4`）→ `partclone.restore` V2 100% SHA-256 吻合 → `merge` 合併回原版完整映像 → `SeekZilla Browser` **0.002s～0.004s** 瞬開與 100% SHA-256 復原 |
 
 ---
 
@@ -80,8 +86,9 @@
 
 ---
 
-## CLI 多磁碟備份用法
+## CLI 進階工具：多磁碟備份、補建 `.rzbhash` 與合併差異映像
 
+### 1. 多磁碟批次備份
 `rescuezillapy backup --source` 亦已擴充支援多顆磁碟，並於建立任何目錄前完成正規化、去重與 `--partitions` 預檢：
 
 ```bash
@@ -94,6 +101,22 @@ sudo rescuezillapy backup \
   --destination /mnt/backup/2026-11-28-img \
   --compression-format zstd \
   --compression-level 3
+```
+
+### 2. 為既有完整備份離線補建 `.rzbhash` 差異基準索引（唯讀來源）
+```bash
+# 針對舊版 v1.0 / v1.1 完整備份的單一分區補建 Info-bhash-<part>.rzbhash：
+python3 /usr/lib/python3/dist-packages/rescuezilla/block_hash.py build-from-image \
+  --image-dir /mnt/backup/2026-11-27-img-nvme0n1 \
+  --partition nvme0n1p1
+```
+
+### 3. 將差異備份合併為獨立的官方相容完整備份（`merge`）
+```bash
+python3 /usr/lib/python3/dist-packages/rescuezilla/diff_synthesizer.py merge \
+  --diff-dir /mnt/backup/2026-11-28-diff-seekzilla-nvme0n1 \
+  --output-dir /mnt/backup/2026-11-28-standalone-nvme0n1 \
+  --format zstd --level 3
 ```
 
 ---

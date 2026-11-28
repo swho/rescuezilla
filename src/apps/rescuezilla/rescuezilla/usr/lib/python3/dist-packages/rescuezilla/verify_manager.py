@@ -2,6 +2,9 @@
 #   Copyright (C) 2012 RedoBackup.org
 #   Copyright (C) 2003-2025 Steven Shiau <steven _at_ clonezilla org>
 #   Copyright (C) 2019-2025 Rescuezilla.com <rescuezilla@gmail.com>
+#   Modified 2026-11-28 (Community Fork): SeekZilla differential (rzdiff)
+#   verify via diff_synthesizer.py stream | partclone.chkimg, plus shared
+#   rzdiff pipeline helpers used by restore_manager (GPL-3.0-or-later).
 # ----------------------------------------------------------------------
 #   This program is free software: you can redistribute it and/or modify
 #   it under the terms of the GNU General Public License as published by
@@ -19,6 +22,8 @@
 import collections
 import os
 import subprocess
+import sys
+import tempfile
 import threading
 import traceback
 from datetime import datetime
@@ -30,6 +35,157 @@ from logger import Logger
 from parser.partclone import Partclone
 from parser.fsarchiver_image import FsArchiverImage
 from utility import Utility, _
+
+
+# ----------------------------------------------------------------------
+# SeekZilla differential (rzdiff) restore/verify pipeline helpers
+# (shared with restore_manager.py)
+# ----------------------------------------------------------------------
+
+# diff_synthesizer.py exit codes -> human readable cause
+RZDIFF_SYNTH_EXIT_DESCRIPTIONS = {
+    1: "differential synthesizer error",
+    3: "base image mismatch (the Base image is not the one this differential backup was taken against)",
+    4: "base image corruption (Base image data does not match its block-hash index: bit rot or tampering)",
+    5: "differential backup corruption (differential metadata or delta data is damaged)",
+    141: "broken pipe (the consumer process exited early)",
+}
+
+
+def get_diff_synthesizer_script_path() -> str:
+    """Absolute path of diff_synthesizer.py next to this module (cwd-independent)."""
+    return os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "diff_synthesizer.py"
+    )
+
+
+def build_rzdiff_synth_cmd_list(diff_dir, base_dir, short_prefix):
+    """`diff_synthesizer.py stream` command writing the Partclone v0002 stream to stdout."""
+    return [
+        sys.executable,
+        get_diff_synthesizer_script_path(),
+        "stream",
+        "--diff-dir",
+        str(diff_dir),
+        "--base-dir",
+        str(base_dir),
+        "--partition",
+        str(short_prefix),
+    ]
+
+
+def resolve_rzdiff_base_dir(diff_dir):
+    """Return (base_dir, None) or (None, actionable error message). Never raises."""
+    try:
+        import diff_format
+    except Exception as exc:
+        return None, "Differential backup support is unavailable: " + str(exc)
+    manifest = None
+    try:
+        manifest = diff_format.load_diff_manifest(diff_dir)
+        if manifest is None:
+            raise diff_format.DiffFormatError(
+                "missing " + diff_format.DIFF_MANIFEST_FILENAME + " in " + str(diff_dir)
+            )
+        return str(diff_format.resolve_base_dir(diff_dir, manifest)), None
+    except (FileNotFoundError, diff_format.DiffFormatError, OSError, ValueError) as exc:
+        base_info = (manifest or {}).get("base_image") or {}
+        required = (
+            base_info.get("suggested_dir_name")
+            or base_info.get("relative_path")
+            or "(unknown)"
+        )
+        message = (
+            "This is a SeekZilla differential backup. It only contains the blocks that "
+            "changed since its Base image and cannot be used without it.\n"
+            "Required Base image folder: {required}\n"
+            "Expected location: next to the differential backup folder {diff_dir}\n"
+            "Copy or mount the Base image folder there (unchanged), then try again.\n"
+            "Details: {details}"
+        ).format(required=required, diff_dir=diff_dir, details=str(exc))
+        return None, message
+
+
+def describe_rzdiff_synth_failure(returncode, stderr_text) -> str:
+    """Human readable explanation of a non-zero diff_synthesizer exit."""
+    cause = RZDIFF_SYNTH_EXIT_DESCRIPTIONS.get(
+        returncode, "differential synthesizer failed"
+    )
+    text = "diff_synthesizer exit code {rc}: {cause}".format(rc=returncode, cause=cause)
+    stderr_text = (stderr_text or "").strip()
+    if stderr_text:
+        text += "\n" + stderr_text
+    return text
+
+
+def spawn_rzdiff_pipeline(synth_cmd_list, consumer_cmd_list, env, synth_stderr_file):
+    """Spawn `diff_synthesizer.py stream | <partclone consumer>`; returns (synth, consumer).
+
+    The synthesizer gets stdin=/dev/null and writes binary to a pipe that is
+    handed directly to the consumer; the parent's copy of that pipe is closed
+    right after the consumer is spawned so SIGPIPE/EPIPE propagate cleanly when
+    the consumer exits early.
+    """
+    synth_proc = subprocess.Popen(
+        synth_cmd_list,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=synth_stderr_file,
+        env=env,
+    )
+    try:
+        consumer_proc = subprocess.Popen(
+            consumer_cmd_list,
+            stdin=synth_proc.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            encoding="utf-8",
+        )
+    except Exception:
+        try:
+            synth_proc.kill()
+            synth_proc.wait(timeout=5.0)
+        except Exception:
+            pass
+        try:
+            synth_proc.stdout.close()
+        except Exception:
+            pass
+        raise
+    # Close parent's copy so the synthesizer receives SIGPIPE if the consumer exits early.
+    synth_proc.stdout.close()
+    return synth_proc, consumer_proc
+
+
+def read_rzdiff_synth_stderr(synth_stderr_file) -> str:
+    try:
+        synth_stderr_file.seek(0)
+        return synth_stderr_file.read(65536).decode("utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+
+
+def terminate_rzdiff_pipeline(*procs):
+    for p in procs:
+        if p is None:
+            continue
+        try:
+            if p.poll() is None:
+                p.terminate()
+        except Exception:
+            pass
+    for p in procs:
+        if p is None:
+            continue
+        try:
+            p.wait(timeout=5.0)
+        except Exception:
+            try:
+                p.kill()
+                p.wait(timeout=2.0)
+            except Exception:
+                pass
 
 
 # Signals should automatically propagate to processes called with subprocess.run().
@@ -113,6 +269,7 @@ class VerifyManager:
         self.proc.clear()
         self.summary_message_lock = threading.Lock()
         self.summary_message = ""
+        self.rzdiff_failed_partitions = []
         env = Utility.get_env_C_locale()
 
         self.logger = Logger(
@@ -294,6 +451,30 @@ class VerifyManager:
                             + partition_key
                             + ": verifying raw dd images not yet supported.\n"
                         )
+                        cumulative_bytes += partition_estimated_size_bytes
+                        continue
+                    elif "partclone" == image_type and image.image_format_dict_dict[
+                        partition_key
+                    ].get("is_rzdiff", False):
+                        # SeekZilla differential partition: synthesize the full
+                        # Partclone stream from Base + differential, then chkimg it.
+                        rzdiff_outcome = self._verify_rzdiff_partition(
+                            image=image,
+                            partition_key=partition_key,
+                            env=env,
+                            filesystem_verify_message=filesystem_verify_message,
+                            partition_estimated_size_bytes=partition_estimated_size_bytes,
+                            cumulative_bytes=cumulative_bytes,
+                            all_images_total_size_estimate=all_images_total_size_estimate,
+                            total_partition_number=total_partition_number,
+                            all_images_num_partitions=all_images_num_partitions,
+                        )
+                        if rzdiff_outcome == "cancelled":
+                            return self.ui_manager.completed_operation(
+                                callable_fn=self.completed_verify,
+                                succeeded=False,
+                                message=_("User requested operation to stop."),
+                            )
                         cumulative_bytes += partition_estimated_size_bytes
                         continue
                     elif "partclone" == image_type:
@@ -501,9 +682,165 @@ class VerifyManager:
             with self.summary_message_lock:
                 self.summary_message += "\n\n"
 
+        if self.rzdiff_failed_partitions:
+            # Differential partitions that cannot be reconstructed are never
+            # reported as a successful verification.
+            return self.ui_manager.completed_operation(
+                callable_fn=self.completed_verify,
+                succeeded=False,
+                message=_("Differential backup verification failed for: {partitions}").format(
+                    partitions=", ".join(self.rzdiff_failed_partitions)
+                ),
+            )
         return self.ui_manager.completed_operation(
             callable_fn=self.completed_verify, succeeded=True, message=""
         )
+
+    def _verify_rzdiff_partition(
+        self,
+        image,
+        partition_key,
+        env,
+        filesystem_verify_message,
+        partition_estimated_size_bytes,
+        cumulative_bytes,
+        all_images_total_size_estimate,
+        total_partition_number,
+        all_images_num_partitions,
+    ):
+        """Verify one differential partition: diff_synthesizer stream | partclone.chkimg.
+
+        Returns "ok", "failed" (reported loudly) or "cancelled".
+        """
+        fmt_dict = image.image_format_dict_dict[partition_key]
+        diff_dir = fmt_dict.get("diff_dir") or os.path.dirname(image.absolute_path)
+        short_prefix = fmt_dict.get("prefix", partition_key)
+        failed_partitions = getattr(self, "rzdiff_failed_partitions", None)
+        if failed_partitions is None:
+            failed_partitions = self.rzdiff_failed_partitions = []
+
+        def _fail(details):
+            partition_summary = (
+                _("❌")
+                + " "
+                + _("Unable to verify.")
+                + " "
+                + _("Partition {partition_number}").format(partition_number=partition_key)
+                + " (differential backup)\n"
+            )
+            self.logger.write(partition_summary + details + "\n")
+            self.ui_manager.display_error_message(
+                summary_message=partition_summary + "\n" + details
+            )
+            with self.summary_message_lock:
+                self.summary_message += partition_summary + details + "\n"
+            failed_partitions.append(partition_key)
+            return "failed"
+
+        base_dir, base_error = resolve_rzdiff_base_dir(diff_dir)
+        if base_dir is None:
+            return _fail(base_error)
+
+        synth_cmd_list = build_rzdiff_synth_cmd_list(diff_dir, base_dir, short_prefix)
+        verify_command_list = ["partclone.chkimg", "--source", "-"]
+        flat_command_string = Utility.print_cli_friendly(
+            "partclone (differential) command ", [synth_cmd_list, verify_command_list]
+        )
+        synth_key = "rzdiff_synth_" + image.absolute_path + "_" + partition_key
+        chkimg_key = "partclone_verify_" + image.absolute_path + "_" + partition_key
+        synth_stderr_file = tempfile.TemporaryFile(mode="w+b")
+        synth_proc = None
+        chkimg_proc = None
+        try:
+            try:
+                synth_proc, chkimg_proc = spawn_rzdiff_pipeline(
+                    synth_cmd_list, verify_command_list, env, synth_stderr_file
+                )
+            except OSError as exc:
+                return _fail(
+                    "Unable to start: " + flat_command_string + "\n" + str(exc)
+                )
+            # Registered so cancel_verify() terminates the synthesizer too.
+            self.proc[synth_key] = synth_proc
+            self.proc[chkimg_key] = chkimg_proc
+
+            proc_stderr = ""
+            while True:
+                if self.requested_stop:
+                    terminate_rzdiff_pipeline(chkimg_proc, synth_proc)
+                    return "cancelled"
+                output = chkimg_proc.stderr.readline()
+                proc_stderr += output
+                if not output and chkimg_proc.poll() is not None:
+                    break
+                if output:
+                    temp_dict = Partclone.parse_partclone_output(output)
+                    if "completed" in temp_dict.keys():
+                        total_progress_float = Utility.calculate_progress_ratio(
+                            current_partition_completed_percentage=temp_dict["completed"]
+                            / 100.0,
+                            current_partition_bytes=partition_estimated_size_bytes,
+                            cumulative_bytes=cumulative_bytes,
+                            total_bytes=all_images_total_size_estimate,
+                            image_number=total_partition_number,
+                            num_partitions=all_images_num_partitions,
+                        )
+                        self.ui_manager.update_progress_bar(fraction=total_progress_float)
+                    if "remaining" in temp_dict.keys():
+                        self.ui_manager.update_progress_status(
+                            message=filesystem_verify_message + "\n\n" + output
+                        )
+            stdout, stderr = chkimg_proc.communicate()
+            proc_stderr += stderr or ""
+            synth_rc = synth_proc.wait()
+            chkimg_rc = chkimg_proc.returncode
+            synth_stderr = read_rzdiff_synth_stderr(synth_stderr_file)
+        finally:
+            try:
+                synth_stderr_file.close()
+            except Exception:
+                pass
+
+        self.logger.write(
+            "Differential verify exit codes: diff_synthesizer="
+            + str(synth_rc)
+            + " partclone.chkimg="
+            + str(chkimg_rc)
+            + "\nsynthesizer stderr: "
+            + synth_stderr
+            + "\npartclone.chkimg output: "
+            + str(stdout)
+            + str(proc_stderr)
+        )
+        if self.requested_stop:
+            return "cancelled"
+        if synth_rc != 0 or chkimg_rc != 0:
+            details = ""
+            if synth_rc != 0:
+                details += describe_rzdiff_synth_failure(synth_rc, synth_stderr) + "\n\n"
+            details += (
+                "The command used internally was:\n\n"
+                + flat_command_string
+                + "\n\npartclone.chkimg exit code "
+                + str(chkimg_rc)
+                + ": "
+                + str(stdout)
+                + "\n"
+                + str(proc_stderr)
+            )
+            return _fail(details)
+
+        with self.summary_message_lock:
+            self.summary_message += (
+                _("✔")
+                + _("{partition}: filesystem image successfully verified.").format(
+                    partition=partition_key
+                )
+                + " (differential, Base: "
+                + os.path.basename(os.path.normpath(base_dir))
+                + ")\n"
+            )
+        return "ok"
 
     # Intended to be called via event thread
     # Expected to run on GTK event thread

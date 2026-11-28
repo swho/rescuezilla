@@ -244,7 +244,7 @@
   </object>
   <object class="GtkWindow" id="main_window">
     <property name="can-focus">False</property>
-    <property name="title" translatable="yes">Rescuezilla</property>
+    <property name="title" translatable="yes">SeekZilla (Based on Rescuezilla)</property>
     <property name="window-position">center</property>
     <property name="default-width">961</property>
     <property name="default-height">766</property>
@@ -304,7 +304,7 @@
                                 <property name="visible">True</property>
                                 <property name="can-focus">False</property>
                                 <property name="ypad">5</property>
-                                <property name="label" translatable="yes">Welcome</property>
+                                <property name="label" translatable="yes">Welcome to SeekZilla</property>
                                 <property name="xalign">0</property>
                                 <attributes>
                                   <attribute name="weight" value="bold"/>

@@ -14,8 +14,8 @@ msgstr ""
 "Plural-Forms: nplurals=1; plural=0;\n"
 "X-Generator: Weblate 5.17-dev\n"
 
-msgid "Start Rescuezilla"
-msgstr "啟動救援龍（Rescuezilla）"
+msgid "Start SeekZilla"
+msgstr "啟動瞬尋救援龍（SeekZilla）"
 
 msgid "Graphical fallback mode"
 msgstr "圖形回退模式"

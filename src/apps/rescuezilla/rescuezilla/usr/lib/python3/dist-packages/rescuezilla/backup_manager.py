@@ -10,6 +10,10 @@
 #   Modified 2026-11-28 (Community Fork): seekable_compressor telemetry
 #   logging, os-prober cancel cleanup ordering (SIGKILL before lazy umount),
 #   and testable 3-process pipeline spawn helper (GPL-3.0-or-later).
+#   Modified 2026-11-28 (Community Fork): SeekZilla Phase 3 `.rzbhash`
+#   generation during full backups, differential (rzdiff) backup mode with
+#   automatic full-backup fallback and Info-rzdiff-manifest.json
+#   (GPL-3.0-or-later).
 # ----------------------------------------------------------------------
 #   This program is free software: you can redistribute it and/or modify
 #   it under the terms of the GNU General Public License as published by
@@ -26,11 +30,14 @@
 # ----------------------------------------------------------------------
 import collections
 import glob
+import hashlib
+import json
 import os
 import pprint
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import traceback
@@ -372,6 +379,290 @@ def spawn_backup_pipeline(
     return p_partclone, p_comp, p_split
 
 
+# ----------------------------------------------------------------------
+# SeekZilla Phase 3: differential (rzdiff) backup helpers
+# ----------------------------------------------------------------------
+
+SEEKABLE_DIFF_STATS_PREFIX = "[seekable_diff]"
+# diff_writer.py exit code: new partition is incompatible with the base
+# (geometry / filesystem / .rzbhash); nothing was written, do a full backup.
+RZDIFF_EXIT_FALLBACK_FULL = 42
+
+# Manifest "reason" values for partitions saved as full images in diff mode.
+RZDIFF_REASON_FALLBACK = "fallback_incompatible_base"
+RZDIFF_REASON_DD = "non_partclone_dd"
+RZDIFF_REASON_COMPRESSION = "unsupported_compression"
+RZDIFF_REASON_MISSING_BHASH = "missing_base_bhash"
+RZDIFF_REASON_INVALID_BHASH = "invalid_base_bhash"
+RZDIFF_REASON_MISSING_BASE_DIR = "missing_base_dir"
+RZDIFF_REASON_MISSING_BASE_IMAGE = "missing_base_image"
+RZDIFF_REASON_UNREADABLE_BASE_IMAGE = "unreadable_base_image"
+RZDIFF_REASON_UNSAFE_NAME = "unsafe_partition_name"
+RZDIFF_REASON_CLONING = "cloning"
+
+
+def _sibling_script_path(script_name: str) -> str:
+    """Absolute path of a helper script next to this module (cwd-independent).
+
+    Always executed as `[sys.executable, <path>]`, never via `-m` or a bare
+    import, so `rescuezilla.py` (the GUI entry point) can never shadow it.
+    """
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), script_name)
+
+
+def _import_diff_modules():
+    """Lazily import the Phase 1/2 diff modules (only needed in diff mode)."""
+    import block_hash
+    import diff_format
+    import diff_synthesizer
+
+    return block_hash, diff_format, diff_synthesizer
+
+
+def build_diff_writer_cmd_list(
+    base_bhash_path,
+    meta_path,
+    diff_seekidx_path,
+    base_header_sha256_hex,
+    compression_format,
+    level,
+    stats_json_path,
+):
+    """Command list for the streaming differential writer stage of the pipeline."""
+    return [
+        sys.executable,
+        _sibling_script_path("diff_writer.py"),
+        "--base-bhash",
+        base_bhash_path,
+        "--meta-output",
+        meta_path,
+        "--index-output",
+        diff_seekidx_path,
+        "--base-header-sha256",
+        base_header_sha256_hex,
+        "--format",
+        compression_format,
+        "--level",
+        str(level),
+        "--stats-json-output",
+        stats_json_path,
+        "--print-stats",
+    ]
+
+
+def get_rzdiff_partition_paths(dest_dir, short_device_node, filesystem, compression_format):
+    """Return (meta_path, diff_seekidx_path, diff_data_prefix) for one partition."""
+    _bh, _df, _ds = _import_diff_modules()
+    comp_suffix = Utility.get_compression_suffix(compression_format)
+    return (
+        os.path.join(dest_dir, _df.get_diff_meta_filename(short_device_node, filesystem)),
+        os.path.join(dest_dir, _df.get_diff_seekidx_filename(short_device_node)),
+        os.path.join(
+            dest_dir,
+            _df.get_diff_data_prefix(short_device_node, filesystem, comp_suffix),
+        ),
+    )
+
+
+def read_base_partclone_header_sha256(split_paths, fmt) -> str:
+    """SHA-256 (hex) of the base image's raw Partclone header (CRC32-verified).
+
+    Read-only: opens the base split files for reading and never writes there.
+    Raises on any unreadable / non-Partclone-v0002 base stream.
+    """
+    _bh, _df, _ds = _import_diff_modules()
+    stream = _ds.SeekableSplitStream(list(split_paths), fmt, None)
+    try:
+        header, _bitmap = _ds.read_partclone_preamble(stream)
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+    return hashlib.sha256(header.raw).hexdigest()
+
+
+def check_diff_eligibility(
+    base_dir,
+    short_device_node,
+    filesystem,
+    compression_format,
+    is_cloning=False,
+    uses_partclone_fs=True,
+):
+    """Decide whether a partition can be saved as a differential image.
+
+    Returns a dict with `eligible` (bool), `reason` (manifest reason when not
+    eligible), `detail` (human readable) and, when eligible, the base
+    `.rzbhash` path / SHA-256, the base split files, their compression format,
+    the base image prefix (basename) and the base Partclone header SHA-256.
+    Strictly read-only with respect to `base_dir`.
+    """
+    result = {"eligible": False, "reason": None, "detail": ""}
+
+    def _no(reason, detail):
+        result["reason"] = reason
+        result["detail"] = detail
+        return result
+
+    if is_cloning:
+        return _no(RZDIFF_REASON_CLONING, "device-to-device cloning")
+    if not uses_partclone_fs:
+        return _no(RZDIFF_REASON_DD, "partition is saved with partclone.dd")
+    if compression_format not in ("zstd", "gzip"):
+        return _no(
+            RZDIFF_REASON_COMPRESSION,
+            "differential backup needs zstd or gzip, not " + str(compression_format),
+        )
+    if not base_dir or not os.path.isdir(base_dir):
+        return _no(RZDIFF_REASON_MISSING_BASE_DIR, "base folder not found: " + str(base_dir))
+    try:
+        _bh, _df, _ds = _import_diff_modules()
+    except Exception as exc:
+        return _no(RZDIFF_REASON_UNREADABLE_BASE_IMAGE, "diff modules unavailable: " + str(exc))
+    try:
+        _df.validate_safe_identifier(short_device_node, "partition name")
+        _df.validate_safe_identifier(filesystem, "filesystem name")
+    except _df.DiffFormatError as exc:
+        return _no(RZDIFF_REASON_UNSAFE_NAME, str(exc))
+
+    base_bhash_path = os.path.join(base_dir, _bh.bhash_index_filename(short_device_node))
+    if not os.path.isfile(base_bhash_path):
+        return _no(
+            RZDIFF_REASON_MISSING_BHASH,
+            "base has no " + os.path.basename(base_bhash_path),
+        )
+    try:
+        base_bhash = _bh.load_bhash_file(base_bhash_path)
+    except Exception as exc:
+        return _no(RZDIFF_REASON_INVALID_BHASH, "base .rzbhash unusable: " + str(exc))
+
+    try:
+        split_paths, split_fmt = _ds.find_partition_splits(base_dir, short_device_node)
+    except Exception as exc:
+        return _no(RZDIFF_REASON_MISSING_BASE_IMAGE, "base partition image: " + str(exc))
+
+    try:
+        header_sha_hex = read_base_partclone_header_sha256(split_paths, split_fmt)
+    except Exception as exc:
+        return _no(
+            RZDIFF_REASON_UNREADABLE_BASE_IMAGE,
+            "base Partclone header unreadable: " + str(exc),
+        )
+
+    base_prefix = os.path.basename(split_paths[0])[:-2]
+    result.update(
+        {
+            "eligible": True,
+            "reason": None,
+            "detail": "",
+            "base_dir": base_dir,
+            "base_bhash_path": base_bhash_path,
+            "base_bhash_sha256": base_bhash.file_sha256,
+            "base_split_paths": split_paths,
+            "base_split_format": split_fmt,
+            "base_image_prefix": base_prefix,
+            "base_header_sha256_hex": header_sha_hex,
+        }
+    )
+    return result
+
+
+def remove_rzdiff_partition_files(
+    meta_path, diff_seekidx_path, stats_json_path, diff_prefix
+) -> List[str]:
+    """Delete partial differential outputs of one partition; returns failed paths."""
+    candidates = []
+    for path in (meta_path, diff_seekidx_path, stats_json_path):
+        if path:
+            # Also removes atomic_write_bytes temporary siblings ("<path>.tmp...").
+            candidates.extend(glob.glob(glob.escape(path) + "*"))
+    if diff_prefix:
+        candidates.extend(glob.glob(glob.escape(diff_prefix) + "*"))
+    failed = []
+    for path in sorted(set(candidates)):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            failed.append(path)
+    return failed
+
+
+def _read_base_img_id(base_dir):
+    path = os.path.join(base_dir, "Info-img-id.txt")
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("IMG_ID="):
+                    return line[len("IMG_ID=") :]
+    except OSError:
+        pass
+    return None
+
+
+def _read_base_disk(base_dir):
+    path = os.path.join(base_dir, "disk")
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read().strip()
+        return text or None
+    except OSError:
+        return None
+
+
+def build_rzdiff_manifest(dest_dir, base_dir, partitions, full_partitions=None):
+    """Build the Info-rzdiff-manifest.json dict (diff entries + full fallbacks).
+
+    Only differential entries go into `partitions` (every entry there is
+    strictly validated on load); partitions stored as full images are listed
+    under `full_partitions` with their `reason`.
+    """
+    _bh, _df, _ds = _import_diff_modules()
+    abs_dest = os.path.abspath(dest_dir)
+    abs_base = os.path.abspath(base_dir)
+    manifest = _df.make_manifest(
+        base_relative_path=os.path.relpath(abs_base, abs_dest),
+        base_suggested_dir_name=os.path.basename(os.path.normpath(abs_base)),
+        partitions=collections.OrderedDict(partitions),
+    )
+    manifest["base_image"]["img_id"] = _read_base_img_id(base_dir)
+    manifest["base_image"]["disk"] = _read_base_disk(base_dir)
+    manifest["full_partitions"] = collections.OrderedDict(full_partitions or {})
+    manifest["created"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    return manifest
+
+
+def write_rzdiff_manifest_and_readme(dest_dir, base_dir, partitions, full_partitions=None):
+    """Atomically write Info-rzdiff-manifest.json + README-RZDIFF.txt into dest_dir."""
+    _bh, _df, _ds = _import_diff_modules()
+    manifest = build_rzdiff_manifest(dest_dir, base_dir, partitions, full_partitions)
+    _df.write_diff_manifest(dest_dir, manifest)
+    _df.write_diff_readme(dest_dir, os.path.basename(os.path.normpath(os.path.abspath(base_dir))))
+    return manifest
+
+
+def _lookup_drive_mapping(mapping, drive_key):
+    """Look up `drive_key` in a {drive_key: value} dict, tolerating '/dev/' aliases."""
+    if not mapping:
+        return None
+    if drive_key in mapping:
+        return mapping[drive_key]
+    try:
+        norm = normalize_drive_key(drive_key)
+    except ValueError:
+        return None
+    for key, value in mapping.items():
+        try:
+            if normalize_drive_key(key) == norm:
+                return value
+        except ValueError:
+            continue
+    return None
+
+
 # Signals should automatically propagate to processes called with subprocess.run().
 # TODO: This class uses 'subprocess.call', which provides exit code but not stdout/stderr. It would be
 # TODO: VERY useful to display stdout/stderr when the exit code is non-zero, like the RestoreManager does.
@@ -643,11 +934,15 @@ class BackupManager:
                     except Exception:
                         pass
 
-    def _remove_partition_output_files(self, filepath: str, seekidx_path=None):
-        """Delete partial or failed partition image splits and .rzidx using glob.escape."""
+    def _remove_partition_output_files(
+        self, filepath: str, seekidx_path=None, bhash_path=None
+    ):
+        """Delete partial or failed partition image splits, .rzidx and .rzbhash using glob.escape."""
         failed_paths = glob.glob(glob.escape(filepath) + "*")
         if seekidx_path is not None:
             failed_paths.extend(glob.glob(glob.escape(seekidx_path) + "*"))
+        if bhash_path is not None:
+            failed_paths.extend(glob.glob(glob.escape(bhash_path) + "*"))
         for file_path in failed_paths:
             try:
                 os.remove(file_path)
@@ -672,13 +967,24 @@ class BackupManager:
         completed_backup_callback,
         metadata_only_image_to_annotate=None,
         on_separate_thread=True,
+        diff_base_dir=None,
     ):
+        """Back up one drive.
+
+        diff_base_dir: optional existing full SeekZilla image folder (with
+        `.rzbhash` files) to take a differential backup against. `None`
+        (default) performs the regular full backup. Falls back to
+        `compression_dict["diff_base_dir"]` when not given explicitly.
+        """
         self.backup_timestart = datetime.now()
         self.completed_backup_callback = completed_backup_callback
         self.selected_drive_key = selected_drive_key
         self.dest_dir = dest_dir
         self.backup_notes = backup_notes
         self.compression_dict = compression_dict
+        if diff_base_dir is None and isinstance(compression_dict, dict):
+            diff_base_dir = compression_dict.get("diff_base_dir")
+        self.diff_base_dir = diff_base_dir or None
         self.is_rescue = is_rescue
         self.partitions_to_backup = partitions_to_backup
         # Entire machine's drive state
@@ -713,15 +1019,20 @@ class BackupManager:
         is_rescue,
         completed_backup_callback,
         on_separate_thread=True,
+        diff_base_dirs_by_drive=None,
     ):
         """Sequentially back up multiple drives, each into its own standalone backup folder.
 
         Args:
             backup_jobs: List of (drive_key, partitions_to_backup, dest_dir) tuples.
+            diff_base_dirs_by_drive: Optional {drive_key: base_dir} for differential
+                backups; drives without an entry get a regular full backup.
         """
         jobs = list(backup_jobs)
         if len(jobs) == 0:
             raise ValueError("backup_jobs must not be empty")
+        if diff_base_dirs_by_drive is None and isinstance(compression_dict, dict):
+            diff_base_dirs_by_drive = compression_dict.get("diff_base_dirs_by_drive")
         if len(jobs) == 1:
             dk, parts, dest = jobs[0]
             return self.start_backup(
@@ -735,10 +1046,13 @@ class BackupManager:
                 completed_backup_callback=completed_backup_callback,
                 metadata_only_image_to_annotate=None,
                 on_separate_thread=on_separate_thread,
+                diff_base_dir=_lookup_drive_mapping(diff_base_dirs_by_drive, dk),
             )
 
         self.backup_timestart = datetime.now()
         self.completed_backup_callback = completed_backup_callback
+        self.diff_base_dirs_by_drive = dict(diff_base_dirs_by_drive or {})
+        self.diff_base_dir = None
         self.backup_jobs = jobs
         self.drive_state = drive_state
         self.backup_notes = backup_notes
@@ -805,6 +1119,9 @@ class BackupManager:
             self.selected_drive_key = drive_key
             self.partitions_to_backup = partitions_to_backup
             self.dest_dir = dest_dir
+            self.diff_base_dir = _lookup_drive_mapping(
+                getattr(self, "diff_base_dirs_by_drive", None), drive_key
+            )
             self.logger = None
             self.failed_partition_count = 0
             self.succeeded_partition_count = 0
@@ -1050,6 +1367,7 @@ class BackupManager:
         self.at_least_one_non_fatal_error = False
         self.failed_partition_count = 0
         self.succeeded_partition_count = 0
+        self._reset_rzdiff_state()
         # Clear proc dictionary under lock
         with self._proc_lock:
             self.proc.clear()
@@ -2255,308 +2573,16 @@ class BackupManager:
                             )
                             return False, error_message
 
-            # Clonezilla uses -q2 priority by default (partclone > partimage > dd).
-            # PartImage does not appear to be maintained software, so for simplicity, Rescuezilla is using a
-            # partclone > partclone.dd priority
-            # [1] https://clonezilla.org/clonezilla-live/doc/01_Save_disk_image/advanced/09-advanced-param.php
-
-            # TODO: Simplify logic
-            compression_format = self.compression_dict["format"]
-            compression_suffix = Utility.get_compression_suffix(compression_format)
-            seekable_enabled = (
-                bool(self.compression_dict.get("seekable_index", True))
-                and os.environ.get("RESCUEZILLA_SEEKABLE_INDEX", "1") != "0"
-                and not self.is_cloning
-                and compression_format in ("gzip", "zstd")
-            )
-            seekidx_path = None
-            if seekable_enabled:
-                seekidx_path = os.path.join(
-                    self.dest_dir,
-                    Utility.get_seekable_index_filename(short_device_node),
-                )
-                compression_cmd_list = Utility.get_seekable_compression_cmd_list(
-                    compression_format,
-                    self.compression_dict["level"],
-                    seekidx_path,
-                    print_stats=True,
-                )
-            else:
-                compression_cmd_list = Utility.get_compression_cmd_list(
-                    compression_format, self.compression_dict["level"]
-                )
-
-            split_size = "4GB"
-            # Partclone dd blocksize (16MB)
-            partclone_dd_bs = "16777216"
-            filepath = ""
-            # TODO: Re-enable APFS support -- currently partclone Apple Filesystem is not used because it's too unstable [1]
-            # [1] https://github.com/rescuezilla/rescuezilla/issues/65
-            if (
-                shutil.which("partclone." + filesystem) is not None
-                and filesystem != "apfs"
-            ):
-                partclone_cmd_list = (
-                    ["partclone." + filesystem]
-                    + Utility.get_partclone_rescue_options(self.is_rescue)
-                    + [
-                        "--logfile",
-                        "/var/log/partclone.log",
-                        "--clone",
-                        "--source",
-                        partition_key,
-                        "--output",
-                        "-",
-                    ]
-                )
-                filepath = os.path.join(
-                    self.dest_dir,
-                    short_device_node
-                    + "."
-                    + filesystem
-                    + "-ptcl-img."
-                    + compression_suffix
-                    + ".",
-                )
-                split_cmd_list = [
-                    "split",
-                    "--suffix-length=2",
-                    "--bytes=" + split_size,
-                    "-",
-                    filepath,
-                ]
-            elif shutil.which("partclone.dd") is not None:
-                partclone_cmd_list = (
-                    ["partclone.dd"]
-                    + Utility.get_partclone_rescue_options(self.is_rescue)
-                    + [
-                        "--buffer_size=" + partclone_dd_bs,
-                        "--logfile",
-                        "/var/log/partclone.log",
-                        "--source",
-                        partition_key,
-                        "--output",
-                        "-",
-                    ]
-                )
-                filepath = os.path.join(
-                    self.dest_dir,
-                    short_device_node + ".dd-ptcl-img." + compression_suffix + ".",
-                )
-                split_cmd_list = [
-                    "split",
-                    "--suffix-length=2",
-                    "--bytes=" + split_size,
-                    "-",
-                    filepath,
-                ]
-            else:
-                failed_message = "Partclone not found."
-                self.ui_manager.completed_operation(
-                    callable_fn=self.completed_backup,
-                    succeeded=False,
-                    message=failed_message,
-                )
-                return False, failed_message
-
-            if self.is_cloning:
-                # FIXME: Very ugly design
-                # For the cloning case, write a dummy file with the filename that can be scanned by existing Clonezilla
-                # image functions
-                with open(filepath + "aa", "wb") as filehandle:
-                    # Writes some arbitrary data to temp file so Clonezilla image functions will scan as an
-                    # uncompressed image.
-                    # FIXME: Very ugly design
-                    filehandle.write(b"\x0012345678DEADBEEF")
-                continue
-
-            if self.requested_stop:
-                self.ui_manager.completed_operation(
-                    callable_fn=self.completed_backup,
-                    succeeded=False,
-                    message=_("User requested operation to stop."),
-                )
-                return False, _("User requested operation to stop.")
-
-            filesystem_backup_message = _(
-                "Backup {partition_name} containing filesystem {filesystem} to {destination}"
-            ).format(
-                partition_name=partition_key,
+            partition_result = self._backup_partition_image(
+                partition_key=partition_key,
+                short_device_node=short_device_node,
                 filesystem=filesystem,
-                destination=filepath,
+                env=env,
+                total_size=total_size,
+                partition_number=partition_number,
             )
-            self.ui_manager.update_main_statusbar(message=filesystem_backup_message)
-            self._log(filesystem_backup_message)
-
-            flat_command_string = Utility.print_cli_friendly(
-                "Running ", [partclone_cmd_list, compression_cmd_list, split_cmd_list]
-            )
-            comp_stderr_file = tempfile.TemporaryFile(mode="w+b")
-            split_stderr_file = tempfile.TemporaryFile(mode="w+b")
-            p_partclone = None
-            p_comp = None
-            p_split = None
-            try:
-                p_partclone, p_comp, p_split = spawn_backup_pipeline(
-                    partclone_cmd_list,
-                    compression_cmd_list,
-                    split_cmd_list,
-                    env,
-                    comp_stderr_file,
-                    split_stderr_file,
-                )
-                with self._proc_lock:
-                    self.proc["partclone_backup_" + partition_key] = p_partclone
-                    self.proc["compression_" + partition_key] = p_comp
-                    self.proc["split_" + partition_key] = p_split
-
-                partclone_stderr = ""
-                # Process partclone output. Partclone outputs an update every 3 seconds, so processing the data
-                # on the current thread, for simplicity.
-                # Poll process.stdout to show stdout live
-                while True:
-                    if self.requested_stop:
-                        self._terminate_and_wait_partition_procs(partition_key)
-                        self._remove_partition_output_files(filepath, seekidx_path)
-                        raise _BackupCancelledError()
-
-                    output = p_partclone.stderr.readline()
-                    if not output and p_partclone.poll() is not None:
-                        break
-                    if output:
-                        partclone_stderr += output
-                        temp_dict = Partclone.parse_partclone_output(output)
-                        if "completed" in temp_dict.keys():
-                            total_progress_float = Utility.calculate_progress_ratio(
-                                current_partition_completed_percentage=temp_dict[
-                                    "completed"
-                                ]
-                                / 100.0,
-                                current_partition_bytes=self.partitions_to_backup[
-                                    partition_key
-                                ]["size"],
-                                cumulative_bytes=self.partitions_to_backup[
-                                    partition_key
-                                ]["cumulative_bytes"],
-                                total_bytes=total_size,
-                                image_number=partition_number,
-                                num_partitions=len(self.partitions_to_backup),
-                            )
-                            self.ui_manager.update_progress_bar(
-                                fraction=total_progress_float
-                            )
-                        if "remaining" in temp_dict.keys():
-                            self.ui_manager.update_progress_status(
-                                message=filesystem_backup_message + "\n\n" + output
-                            )
-
-                if self.requested_stop:
-                    self._terminate_and_wait_partition_procs(partition_key)
-                    self._remove_partition_output_files(filepath, seekidx_path)
-                    raise _BackupCancelledError()
-
-                if p_partclone.stderr is not None:
-                    try:
-                        p_partclone.stderr.close()
-                    except Exception:
-                        pass
-                _rc = p_partclone.wait()
-                self._log("Partclone exit code: " + str(_rc))
-
-                # Ensure compression (including atomic .rzidx flush) and split finish cleanly
-                comp_rc = p_comp.wait()
-                split_rc = p_split.wait()
-
-                if self.requested_stop:
-                    self._remove_partition_output_files(filepath, seekidx_path)
-                    raise _BackupCancelledError()
-
-                comp_stderr_file.seek(0)
-                compression_stderr = (
-                    comp_stderr_file.read(65536)
-                    .decode("utf-8", errors="replace")
-                    .strip()
-                )
-                split_stderr_file.seek(0)
-                split_stderr = (
-                    split_stderr_file.read(65536)
-                    .decode("utf-8", errors="replace")
-                    .strip()
-                )
-                # Record seekable_compressor --print-stats telemetry into clonezilla-img
-                # only when the entire partition pipeline succeeded.
-                if p_partclone.returncode == 0 and comp_rc == 0 and split_rc == 0:
-                    self._log_compression_telemetry(
-                        partition_key, comp_rc, compression_stderr
-                    )
-            finally:
-                try:
-                    comp_stderr_file.close()
-                except Exception:
-                    pass
-                try:
-                    split_stderr_file.close()
-                except Exception:
-                    pass
-
-            if p_partclone.returncode != 0 or comp_rc != 0 or split_rc != 0:
-                self.failed_partition_count += 1
-                partition_summary = (
-                    _("<b>Failed to backup partition</b> {partition_name}").format(
-                        partition_name=partition_key
-                    )
-                    + "\n"
-                )
-                with self.summary_message_lock:
-                    self.summary_message += partition_summary
-                self.at_least_one_non_fatal_error = True
-                extra_info = (
-                    "\nThe command used internally was:\n\n"
-                    + flat_command_string
-                    + "\n\n"
-                    + "The output of the command was: "
-                    + partclone_stderr
-                )
-                compression_error_stderr = (
-                    compression_stderr
-                    if comp_rc != 0
-                    else strip_seekable_compressor_stats(compression_stderr)
-                )
-                if compression_error_stderr:
-                    extra_info += (
-                        "\n\n"
-                        + str(compression_cmd_list)
-                        + " stderr: "
-                        + compression_error_stderr
-                    )
-                    self._log(
-                        "Compression stderr ("
-                        + partition_key
-                        + "): "
-                        + compression_error_stderr
-                    )
-                if split_stderr:
-                    extra_info += (
-                        "\n\n" + str(split_cmd_list) + " stderr: " + split_stderr
-                    )
-                    self._log("Split stderr (" + partition_key + "): " + split_stderr)
-
-                # TODO: Try to backup again, but using partclone.dd
-                self.ui_manager.display_error_message(
-                    summary_message=partition_summary + extra_info
-                )
-                # Delete failed partclone files (and any seek index file)
-                self._remove_partition_output_files(filepath, seekidx_path)
-
-            else:
-                self.succeeded_partition_count += 1
-                with self.summary_message_lock:
-                    self.summary_message += (
-                        _("Successful backup of partition {partition_name}").format(
-                            partition_name=partition_key
-                        )
-                        + "\n"
-                    )
+            if partition_result is not None:
+                return partition_result
 
         if self.requested_stop:
             self.ui_manager.completed_operation(
@@ -2604,9 +2630,725 @@ class BackupManager:
         # Do checksum
         # IMG_ID=$(LC_ALL=C sha512sum $img_dir/clonezilla-img | awk -F" " '{print $1}')" >> $img_dir/Info-img-id.txt
 
+        # SeekZilla differential backup: link this folder to its base image.
+        is_manifest_ok, manifest_message = self._finalize_rzdiff_manifest()
+        if not is_manifest_ok:
+            self.failed_partition_count += 1
+            self._add_summary(manifest_message + "\n")
+            self.ui_manager.completed_operation(
+                callable_fn=self.completed_backup,
+                succeeded=False,
+                message=manifest_message,
+            )
+            return False, manifest_message
+
         self.ui_manager.completed_operation(
             callable_fn=self.completed_backup, succeeded=True, message=""
         )
+        return True, ""
+
+    # ------------------------------------------------------------------
+    # SeekZilla Phase 3: per-partition image (full / differential)
+    # ------------------------------------------------------------------
+
+    def _reset_rzdiff_state(self):
+        """Reset per-drive differential bookkeeping (called at each do_backup)."""
+        self.diff_base_dir = getattr(self, "diff_base_dir", None) or None
+        dest_dir = getattr(self, "dest_dir", None)
+        if self.diff_base_dir and dest_dir:
+            base_real = os.path.realpath(self.diff_base_dir)
+            dest_real = os.path.realpath(dest_dir)
+            if base_real == dest_real or dest_real.startswith(base_real + os.sep):
+                # Never write a differential backup into (or below) its own base.
+                print(
+                    "Refusing differential backup: destination "
+                    + dest_dir
+                    + " is inside base "
+                    + self.diff_base_dir
+                )
+                self.diff_base_dir = None
+        self.rzdiff_partitions = collections.OrderedDict()
+        self.rzdiff_full_partitions = collections.OrderedDict()
+
+    def _add_summary(self, text: str):
+        with self.summary_message_lock:
+            self.summary_message += text
+
+    def _pump_partclone_progress(
+        self,
+        p_partclone,
+        partition_key,
+        status_message,
+        total_size,
+        partition_number,
+        on_cancel,
+    ) -> str:
+        """Read partclone's stderr until EOF, updating progress; returns the stderr text.
+
+        On user cancel the partition's processes are terminated/reaped, then
+        `on_cancel()` (partial-output cleanup) runs and _BackupCancelledError is raised.
+        """
+        partclone_stderr = ""
+        while True:
+            if self.requested_stop:
+                self._terminate_and_wait_partition_procs(partition_key)
+                on_cancel()
+                raise _BackupCancelledError()
+            output = p_partclone.stderr.readline()
+            if not output and p_partclone.poll() is not None:
+                break
+            if output:
+                partclone_stderr += output
+                temp_dict = Partclone.parse_partclone_output(output)
+                if "completed" in temp_dict.keys():
+                    part_info = self.partitions_to_backup.get(partition_key, {})
+                    total_progress_float = Utility.calculate_progress_ratio(
+                        current_partition_completed_percentage=temp_dict["completed"]
+                        / 100.0,
+                        current_partition_bytes=part_info.get("size", 0),
+                        cumulative_bytes=part_info.get("cumulative_bytes", 0),
+                        total_bytes=total_size,
+                        image_number=partition_number,
+                        num_partitions=len(self.partitions_to_backup),
+                    )
+                    self.ui_manager.update_progress_bar(fraction=total_progress_float)
+                if "remaining" in temp_dict.keys():
+                    self.ui_manager.update_progress_status(
+                        message=status_message + "\n\n" + output
+                    )
+        return partclone_stderr
+
+    def _try_diff_partition_backup(
+        self,
+        partition_key,
+        short_device_node,
+        filesystem,
+        compression_format,
+        partclone_cmd_list,
+        uses_partclone_fs,
+        env,
+        total_size,
+        partition_number,
+    ):
+        """Attempt a differential backup of one partition against self.diff_base_dir.
+
+        Returns (outcome, reason):
+          ("diff", None)    differential image written and recorded for the manifest
+          ("failed", None)  pipeline failed (already reported, outputs removed)
+          ("full", reason)  not eligible / incompatible: caller runs the full pipeline
+        Raises _BackupCancelledError on user cancel (partial outputs removed).
+        Nothing is ever written inside the base directory.
+        """
+        base_dir = self.diff_base_dir
+        elig = check_diff_eligibility(
+            base_dir,
+            short_device_node,
+            filesystem,
+            compression_format,
+            is_cloning=self.is_cloning,
+            uses_partclone_fs=uses_partclone_fs,
+        )
+        if not elig["eligible"]:
+            notice = (
+                "Differential backup not possible for "
+                + partition_key
+                + " ("
+                + str(elig["reason"])
+                + ": "
+                + str(elig["detail"])
+                + "); saving a full image of this partition instead."
+            )
+            self._log(notice + "\n")
+            self._add_summary(notice + "\n")
+            return "full", elig["reason"]
+
+        meta_path, diff_seekidx_path, diff_prefix = get_rzdiff_partition_paths(
+            self.dest_dir, short_device_node, filesystem, compression_format
+        )
+        fd, stats_json_path = tempfile.mkstemp(
+            prefix="rzdiff-stats-" + short_device_node + "-", suffix=".json"
+        )
+        os.close(fd)
+
+        def _cleanup():
+            for failed in remove_rzdiff_partition_files(
+                meta_path, diff_seekidx_path, stats_json_path, diff_prefix
+            ):
+                self._log("Unable to remove: " + failed)
+                self._add_summary("Unable to remove: " + failed + "\n")
+
+        writer_cmd_list = build_diff_writer_cmd_list(
+            elig["base_bhash_path"],
+            meta_path,
+            diff_seekidx_path,
+            elig["base_header_sha256_hex"],
+            compression_format,
+            self.compression_dict["level"],
+            stats_json_path,
+        )
+        split_cmd_list = [
+            "split",
+            "--suffix-length=2",
+            "--bytes=4GB",
+            "-",
+            diff_prefix,
+        ]
+        status_message = _(
+            "Differential backup of {partition_name} ({filesystem}) to {destination} (base: {base})"
+        ).format(
+            partition_name=partition_key,
+            filesystem=filesystem,
+            destination=diff_prefix,
+            base=base_dir,
+        )
+        self.ui_manager.update_main_statusbar(message=status_message)
+        self._log(status_message)
+        flat_command_string = Utility.print_cli_friendly(
+            "Running ", [partclone_cmd_list, writer_cmd_list, split_cmd_list]
+        )
+        comp_stderr_file = tempfile.TemporaryFile(mode="w+b")
+        split_stderr_file = tempfile.TemporaryFile(mode="w+b")
+        p_partclone = None
+        partclone_stderr = ""
+        comp_rc = None
+        split_rc = None
+        writer_stderr = ""
+        split_stderr = ""
+        try:
+            try:
+                p_partclone, p_comp, p_split = spawn_backup_pipeline(
+                    partclone_cmd_list,
+                    writer_cmd_list,
+                    split_cmd_list,
+                    env,
+                    comp_stderr_file,
+                    split_stderr_file,
+                )
+            except Exception:
+                _cleanup()
+                raise
+            with self._proc_lock:
+                self.proc["partclone_backup_" + partition_key] = p_partclone
+                self.proc["compression_" + partition_key] = p_comp
+                self.proc["split_" + partition_key] = p_split
+
+            partclone_stderr = self._pump_partclone_progress(
+                p_partclone,
+                partition_key,
+                status_message,
+                total_size,
+                partition_number,
+                on_cancel=_cleanup,
+            )
+            if p_partclone.stderr is not None:
+                try:
+                    p_partclone.stderr.close()
+                except Exception:
+                    pass
+            pc_rc = p_partclone.wait()
+            comp_rc = p_comp.wait()
+            split_rc = p_split.wait()
+            self._log(
+                "Differential pipeline exit codes ("
+                + partition_key
+                + "): partclone="
+                + str(pc_rc)
+                + " diff_writer="
+                + str(comp_rc)
+                + " split="
+                + str(split_rc)
+                + "\n"
+            )
+            if self.requested_stop:
+                self._terminate_and_wait_partition_procs(partition_key)
+                _cleanup()
+                raise _BackupCancelledError()
+            comp_stderr_file.seek(0)
+            writer_stderr = (
+                comp_stderr_file.read(65536).decode("utf-8", errors="replace").strip()
+            )
+            split_stderr_file.seek(0)
+            split_stderr = (
+                split_stderr_file.read(65536).decode("utf-8", errors="replace").strip()
+            )
+        finally:
+            for fh in (comp_stderr_file, split_stderr_file):
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+
+        if comp_rc == RZDIFF_EXIT_FALLBACK_FULL:
+            # The new partition cannot be diffed against this base (resized, other
+            # filesystem, other chunk geometry...). diff_writer wrote nothing, but
+            # remove anything that could exist and redo it as a full image.
+            self._terminate_and_wait_partition_procs(partition_key)
+            _cleanup()
+            notice = (
+                "Differential backup fallback for "
+                + partition_key
+                + ": the partition is not compatible with base image "
+                + str(base_dir)
+                + " ("
+                + (writer_stderr or "diff_writer exit code 42")
+                + "). Saving a full image of this partition instead."
+            )
+            self._log(notice + "\n")
+            self._add_summary(notice + "\n")
+            return "full", RZDIFF_REASON_FALLBACK
+
+        if p_partclone.returncode == 0 and comp_rc == 0 and split_rc == 0:
+            stats = None
+            try:
+                with open(stats_json_path, "r", encoding="utf-8") as fh:
+                    stats = json.load(fh)
+            except (OSError, ValueError) as exc:
+                self._log("Unable to read differential stats " + stats_json_path + ": " + str(exc))
+            try:
+                os.remove(stats_json_path)
+            except OSError:
+                pass
+            telemetry_lines = [
+                line.strip()
+                for line in writer_stderr.splitlines()
+                if line.strip().startswith(SEEKABLE_DIFF_STATS_PREFIX)
+            ]
+            if not telemetry_lines and isinstance(stats, dict):
+                telemetry_lines = [
+                    SEEKABLE_DIFF_STATS_PREFIX + " " + json.dumps(stats, sort_keys=True)
+                ]
+            for line in telemetry_lines:
+                self._log("Differential telemetry (" + partition_key + "): " + line + "\n")
+
+            _bh, _df, _ds = _import_diff_modules()
+            entry = _df.make_partition_entry(
+                short_part=short_device_node,
+                fs=filesystem,
+                compression=compression_format,
+                base_bhash_sha256=elig["base_bhash_sha256"],
+                base_image_prefix=elig["base_image_prefix"],
+            )
+            entry["mode"] = "diff"
+            entry["base_header_sha256"] = elig["base_header_sha256_hex"]
+            if isinstance(stats, dict):
+                entry["stats"] = {
+                    key: stats.get(key)
+                    for key in (
+                        "num_chunks",
+                        "changed_chunks",
+                        "unchanged_chunks",
+                        "empty_chunks",
+                        "used_bytes",
+                        "delta_bytes",
+                        "compressed_bytes",
+                        "saved_pct",
+                    )
+                }
+            self.rzdiff_partitions[short_device_node] = entry
+            self.succeeded_partition_count += 1
+            changed_text = ""
+            if isinstance(stats, dict):
+                changed_text = " ({changed}/{total} changed 1 MiB chunks)".format(
+                    changed=stats.get("changed_chunks"),
+                    total=stats.get("num_chunks"),
+                )
+            self._add_summary(
+                _("Successful differential backup of partition {partition_name}").format(
+                    partition_name=partition_key
+                )
+                + changed_text
+                + "\n"
+            )
+            return "diff", None
+
+        # Hard failure (partclone error, corrupt input, disk full ...).
+        self.failed_partition_count += 1
+        partition_summary = (
+            _("<b>Failed to backup partition</b> {partition_name}").format(
+                partition_name=partition_key
+            )
+            + " (differential)\n"
+        )
+        self._add_summary(partition_summary)
+        self.at_least_one_non_fatal_error = True
+        extra_info = (
+            "\nThe command used internally was:\n\n"
+            + flat_command_string
+            + "\n\n"
+            + "The output of the command was: "
+            + partclone_stderr
+        )
+        if writer_stderr:
+            extra_info += "\n\n" + str(writer_cmd_list) + " stderr: " + writer_stderr
+            self._log("diff_writer stderr (" + partition_key + "): " + writer_stderr)
+        if split_stderr:
+            extra_info += "\n\n" + str(split_cmd_list) + " stderr: " + split_stderr
+            self._log("Split stderr (" + partition_key + "): " + split_stderr)
+        self.ui_manager.display_error_message(summary_message=partition_summary + extra_info)
+        _cleanup()
+        return "failed", None
+
+    def _backup_partition_image(
+        self,
+        partition_key,
+        short_device_node,
+        filesystem,
+        env,
+        total_size,
+        partition_number,
+    ):
+        """Save one filesystem image (full, or differential when requested).
+
+        Returns None to continue with the next partition, or a (False, message)
+        tuple when the whole backup must abort (completed_operation already called).
+        """
+        # Clonezilla uses -q2 priority by default (partclone > partimage > dd).
+        # PartImage does not appear to be maintained software, so for simplicity, Rescuezilla is using a
+        # partclone > partclone.dd priority
+        # [1] https://clonezilla.org/clonezilla-live/doc/01_Save_disk_image/advanced/09-advanced-param.php
+
+        # TODO: Simplify logic
+        compression_format = self.compression_dict["format"]
+        compression_suffix = Utility.get_compression_suffix(compression_format)
+        # TODO: Re-enable APFS support -- currently partclone Apple Filesystem is not used because it's too unstable [1]
+        # [1] https://github.com/rescuezilla/rescuezilla/issues/65
+        uses_partclone_fs = (
+            shutil.which("partclone." + filesystem) is not None
+            and filesystem != "apfs"
+        )
+        seekable_enabled = (
+            bool(self.compression_dict.get("seekable_index", True))
+            and os.environ.get("RESCUEZILLA_SEEKABLE_INDEX", "1") != "0"
+            and not self.is_cloning
+            and compression_format in ("gzip", "zstd")
+        )
+        seekidx_path = None
+        bhash_path = None
+        if seekable_enabled:
+            seekidx_path = os.path.join(
+                self.dest_dir,
+                Utility.get_seekable_index_filename(short_device_node),
+            )
+            if uses_partclone_fs:
+                # SeekZilla block-hash index: makes this image usable as a
+                # differential base (partclone.<fs> streams only, never dd).
+                bhash_path = os.path.join(
+                    self.dest_dir, Utility.get_bhash_index_filename(short_device_node)
+                )
+            compression_cmd_list = Utility.get_seekable_compression_cmd_list(
+                compression_format,
+                self.compression_dict["level"],
+                seekidx_path,
+                print_stats=True,
+                bhash_output_path=bhash_path,
+            )
+        else:
+            compression_cmd_list = Utility.get_compression_cmd_list(
+                compression_format, self.compression_dict["level"]
+            )
+
+        split_size = "4GB"
+        # Partclone dd blocksize (16MB)
+        partclone_dd_bs = "16777216"
+        filepath = ""
+        if uses_partclone_fs:
+            partclone_cmd_list = (
+                ["partclone." + filesystem]
+                + Utility.get_partclone_rescue_options(self.is_rescue)
+                + [
+                    "--logfile",
+                    "/var/log/partclone.log",
+                    "--clone",
+                    "--source",
+                    partition_key,
+                    "--output",
+                    "-",
+                ]
+            )
+            filepath = os.path.join(
+                self.dest_dir,
+                short_device_node
+                + "."
+                + filesystem
+                + "-ptcl-img."
+                + compression_suffix
+                + ".",
+            )
+            split_cmd_list = [
+                "split",
+                "--suffix-length=2",
+                "--bytes=" + split_size,
+                "-",
+                filepath,
+            ]
+        elif shutil.which("partclone.dd") is not None:
+            partclone_cmd_list = (
+                ["partclone.dd"]
+                + Utility.get_partclone_rescue_options(self.is_rescue)
+                + [
+                    "--buffer_size=" + partclone_dd_bs,
+                    "--logfile",
+                    "/var/log/partclone.log",
+                    "--source",
+                    partition_key,
+                    "--output",
+                    "-",
+                ]
+            )
+            filepath = os.path.join(
+                self.dest_dir,
+                short_device_node + ".dd-ptcl-img." + compression_suffix + ".",
+            )
+            split_cmd_list = [
+                "split",
+                "--suffix-length=2",
+                "--bytes=" + split_size,
+                "-",
+                filepath,
+            ]
+        else:
+            failed_message = "Partclone not found."
+            self.ui_manager.completed_operation(
+                callable_fn=self.completed_backup,
+                succeeded=False,
+                message=failed_message,
+            )
+            return False, failed_message
+
+        if self.is_cloning:
+            # FIXME: Very ugly design
+            # For the cloning case, write a dummy file with the filename that can be scanned by existing Clonezilla
+            # image functions
+            with open(filepath + "aa", "wb") as filehandle:
+                # Writes some arbitrary data to temp file so Clonezilla image functions will scan as an
+                # uncompressed image.
+                # FIXME: Very ugly design
+                filehandle.write(b"\x0012345678DEADBEEF")
+            return None
+
+        if self.requested_stop:
+            self.ui_manager.completed_operation(
+                callable_fn=self.completed_backup,
+                succeeded=False,
+                message=_("User requested operation to stop."),
+            )
+            return False, _("User requested operation to stop.")
+
+        if getattr(self, "diff_base_dir", None):
+            outcome, reason = self._try_diff_partition_backup(
+                partition_key=partition_key,
+                short_device_node=short_device_node,
+                filesystem=filesystem,
+                compression_format=compression_format,
+                partclone_cmd_list=partclone_cmd_list,
+                uses_partclone_fs=uses_partclone_fs,
+                env=env,
+                total_size=total_size,
+                partition_number=partition_number,
+            )
+            if outcome in ("diff", "failed"):
+                return None
+            # Not eligible / incompatible base: full image (+ .rzidx/.rzbhash) below.
+            self.rzdiff_full_partitions[short_device_node] = {
+                "mode": "full",
+                "reason": reason,
+                "fs": "dd" if not uses_partclone_fs else filesystem,
+            }
+
+        filesystem_backup_message = _(
+            "Backup {partition_name} containing filesystem {filesystem} to {destination}"
+        ).format(
+            partition_name=partition_key,
+            filesystem=filesystem,
+            destination=filepath,
+        )
+        self.ui_manager.update_main_statusbar(message=filesystem_backup_message)
+        self._log(filesystem_backup_message)
+
+        flat_command_string = Utility.print_cli_friendly(
+            "Running ", [partclone_cmd_list, compression_cmd_list, split_cmd_list]
+        )
+        comp_stderr_file = tempfile.TemporaryFile(mode="w+b")
+        split_stderr_file = tempfile.TemporaryFile(mode="w+b")
+        p_partclone = None
+        p_comp = None
+        p_split = None
+
+        def _cleanup_full():
+            self._remove_partition_output_files(filepath, seekidx_path, bhash_path)
+
+        try:
+            p_partclone, p_comp, p_split = spawn_backup_pipeline(
+                partclone_cmd_list,
+                compression_cmd_list,
+                split_cmd_list,
+                env,
+                comp_stderr_file,
+                split_stderr_file,
+            )
+            with self._proc_lock:
+                self.proc["partclone_backup_" + partition_key] = p_partclone
+                self.proc["compression_" + partition_key] = p_comp
+                self.proc["split_" + partition_key] = p_split
+
+            # Process partclone output. Partclone outputs an update every 3 seconds, so processing the data
+            # on the current thread, for simplicity.
+            partclone_stderr = self._pump_partclone_progress(
+                p_partclone,
+                partition_key,
+                filesystem_backup_message,
+                total_size,
+                partition_number,
+                on_cancel=_cleanup_full,
+            )
+
+            if self.requested_stop:
+                self._terminate_and_wait_partition_procs(partition_key)
+                self._remove_partition_output_files(filepath, seekidx_path, bhash_path)
+                raise _BackupCancelledError()
+
+            if p_partclone.stderr is not None:
+                try:
+                    p_partclone.stderr.close()
+                except Exception:
+                    pass
+            _rc = p_partclone.wait()
+            self._log("Partclone exit code: " + str(_rc))
+
+            # Ensure compression (including atomic .rzidx/.rzbhash flush) and split finish cleanly
+            comp_rc = p_comp.wait()
+            split_rc = p_split.wait()
+
+            if self.requested_stop:
+                self._remove_partition_output_files(filepath, seekidx_path, bhash_path)
+                raise _BackupCancelledError()
+
+            comp_stderr_file.seek(0)
+            compression_stderr = (
+                comp_stderr_file.read(65536).decode("utf-8", errors="replace").strip()
+            )
+            split_stderr_file.seek(0)
+            split_stderr = (
+                split_stderr_file.read(65536).decode("utf-8", errors="replace").strip()
+            )
+            # Record seekable_compressor --print-stats telemetry into clonezilla-img
+            # only when the entire partition pipeline succeeded.
+            if p_partclone.returncode == 0 and comp_rc == 0 and split_rc == 0:
+                self._log_compression_telemetry(
+                    partition_key, comp_rc, compression_stderr
+                )
+        finally:
+            try:
+                comp_stderr_file.close()
+            except Exception:
+                pass
+            try:
+                split_stderr_file.close()
+            except Exception:
+                pass
+
+        if p_partclone.returncode != 0 or comp_rc != 0 or split_rc != 0:
+            self.failed_partition_count += 1
+            partition_summary = (
+                _("<b>Failed to backup partition</b> {partition_name}").format(
+                    partition_name=partition_key
+                )
+                + "\n"
+            )
+            with self.summary_message_lock:
+                self.summary_message += partition_summary
+            self.at_least_one_non_fatal_error = True
+            extra_info = (
+                "\nThe command used internally was:\n\n"
+                + flat_command_string
+                + "\n\n"
+                + "The output of the command was: "
+                + partclone_stderr
+            )
+            compression_error_stderr = (
+                compression_stderr
+                if comp_rc != 0
+                else strip_seekable_compressor_stats(compression_stderr)
+            )
+            if compression_error_stderr:
+                extra_info += (
+                    "\n\n"
+                    + str(compression_cmd_list)
+                    + " stderr: "
+                    + compression_error_stderr
+                )
+                self._log(
+                    "Compression stderr ("
+                    + partition_key
+                    + "): "
+                    + compression_error_stderr
+                )
+            if split_stderr:
+                extra_info += "\n\n" + str(split_cmd_list) + " stderr: " + split_stderr
+                self._log("Split stderr (" + partition_key + "): " + split_stderr)
+
+            # TODO: Try to backup again, but using partclone.dd
+            self.ui_manager.display_error_message(
+                summary_message=partition_summary + extra_info
+            )
+            # Delete failed partclone files (and any seek index / block-hash file)
+            self._remove_partition_output_files(filepath, seekidx_path, bhash_path)
+            if getattr(self, "diff_base_dir", None):
+                self.rzdiff_full_partitions.pop(short_device_node, None)
+
+        else:
+            self.succeeded_partition_count += 1
+            with self.summary_message_lock:
+                self.summary_message += (
+                    _("Successful backup of partition {partition_name}").format(
+                        partition_name=partition_key
+                    )
+                    + "\n"
+                )
+        return None
+
+    def _finalize_rzdiff_manifest(self):
+        """Write Info-rzdiff-manifest.json + README-RZDIFF.txt after the partition loop.
+
+        Returns (True, "") when nothing had to be written or writing succeeded,
+        otherwise (False, error_message). Never writes inside the base folder.
+        """
+        base_dir = getattr(self, "diff_base_dir", None)
+        if not base_dir:
+            return True, ""
+        diff_parts = getattr(self, "rzdiff_partitions", None) or {}
+        if not diff_parts:
+            notice = (
+                "Differential backup requested against "
+                + str(base_dir)
+                + ", but no partition could be saved differentially; "
+                "this folder is a regular standalone full backup."
+            )
+            self._log(notice + "\n")
+            self._add_summary(notice + "\n")
+            return True, ""
+        try:
+            write_rzdiff_manifest_and_readme(
+                self.dest_dir,
+                base_dir,
+                diff_parts,
+                getattr(self, "rzdiff_full_partitions", None),
+            )
+        except Exception as exc:
+            message = (
+                "Failed to write differential backup manifest into "
+                + str(self.dest_dir)
+                + ": "
+                + str(exc)
+            )
+            self._log(message)
+            return False, message
+        notice = (
+            "Differential backup: {n} partition(s) saved as differences against base image {base}. "
+            "Keep the base image folder next to this backup; both are required to restore."
+        ).format(n=len(diff_parts), base=os.path.basename(os.path.normpath(base_dir)))
+        self._log(notice + "\n")
+        self._add_summary(notice + "\n")
         return True, ""
 
     # Implementation of Clonezilla "check_if_windows_boot_reserve_part" function

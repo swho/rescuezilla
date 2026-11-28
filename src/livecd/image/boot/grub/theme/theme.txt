@@ -18,12 +18,12 @@ terminal-font: "Unifont Regular 16"
         # p%+x  mixture of both
         left = 0%
         top = 5%
-        width = 100%
+        width = 98%
         height = 10%
         # This field is modified by the build scripts, typically in the form: "X.Y.Z 64bit 20XX-YY-ZZT012345"
         text = "VERSION-SUBSTITUTED-BY-BUILD-SCRIPT MEMORY-BUS-WIDTH-SUBSTITUTED-BY-BUILD-SCRIPT GIT-COMMIT-DATE-SUBSTITUTED-BY-BUILD-SCRIPT"
         align = "right"
-        color = "black"
+        color = "#0F172A"
         font = "DejaVu Sans Bold 16"
 }
 
@@ -63,12 +63,12 @@ terminal-font: "Unifont Regular 16"
         id = "__timeout__"
         # The border color for plain solid color rendering.
         # (Using a color from the background image)
-        fg_color = "#345278"
+        fg_color = "#0284C7"
         # The background color for plain solid color rendering.
         bg_color = "white"
         # The border color for plain solid color rendering.
         border_color = "black"
-        text_color = "#F39721"
+        text_color = "#0EA5E9"
         font = "DejaVu Sans Bold 6"
         # The text to display on the progress bar. If the progress bar’s ID is set to “__timeout__“ and the value of this property is set to
         # “@TIMEOUT_NOTIFICATION_SHORT@“, “@TIMEOUT_NOTIFICATION_MIDDLE@“ or “@TIMEOUT_NOTIFICATION_LONG@“, then GRUB will update this property
@@ -81,10 +81,10 @@ terminal-font: "Unifont Regular 16"
 + label {
         left = 0%
         top = 90%
-        width = 100%
+        width = 98%
         height = 10%
         text = "@KEYMAP_SHORT@"
         align = "right"
-        color = "black"
+        color = "#0F172A"
         item_font = "DejaVu Sans Bold 14"
 }

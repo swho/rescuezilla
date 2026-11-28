@@ -567,6 +567,15 @@ class ImageExplorerManager:
                 or isinstance(self.selected_image, FoxcloneImage)
                 or isinstance(self.selected_image, ApartGtkImage)
             ):
+                if image.image_format_dict_dict[partition_key].get("is_rzdiff", False):
+                    GLib.idle_add(
+                        callback,
+                        False,
+                        "Image Explorer (beta) does not mount differential (rzdiff) images directly.\n\n"
+                        "Use SeekZilla Browser for instant rootless browsing, or flatten to a standalone full image with diff_synthesizer merge.",
+                    )
+                    GLib.idle_add(please_wait_popup.destroy)
+                    return
                 # Clonezilla images support gzip bzip2 lzo lzma xz lzip lrzip lz4 zstd and uncompressed.
                 if (
                     "absolute_filename_glob_list"

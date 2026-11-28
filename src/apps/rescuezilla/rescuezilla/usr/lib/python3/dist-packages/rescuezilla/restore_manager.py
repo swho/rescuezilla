@@ -2,6 +2,9 @@
 #   Copyright (C) 2012 RedoBackup.org
 #   Copyright (C) 2003-2025 Steven Shiau <steven _at_ clonezilla org>
 #   Copyright (C) 2019-2025 Rescuezilla.com <rescuezilla@gmail.com>
+#   Modified 2026-11-28 (Community Fork): SeekZilla differential (rzdiff)
+#   restore via diff_synthesizer.py stream | partclone.<fs> --restore
+#   (GPL-3.0-or-later).
 # ----------------------------------------------------------------------
 #   This program is free software: you can redistribute it and/or modify
 #   it under the terms of the GNU General Public License as published by
@@ -43,6 +46,14 @@ from parser.lvm import Lvm
 from parser.partclone import Partclone
 from parser.proc_partitions import ProcPartitions
 from utility import Utility, _
+from verify_manager import (
+    build_rzdiff_synth_cmd_list,
+    describe_rzdiff_synth_failure,
+    read_rzdiff_synth_stderr,
+    resolve_rzdiff_base_dir,
+    spawn_rzdiff_pipeline,
+    terminate_rzdiff_pipeline,
+)
 
 # Signals should automatically propagate to processes called with subprocess.run().
 
@@ -346,6 +357,7 @@ class RestoreManager:
         self.proc.clear()
         self.summary_message_lock = threading.Lock()
         self.summary_message = ""
+        self.rzdiff_failed_partitions = []
         env = Utility.get_env_C_locale()
 
         with self.summary_message_lock:
@@ -1135,8 +1147,30 @@ class RestoreManager:
                 )
                 self.logger.write(filesystem_restore_message)
                 self.ui_manager.display_status(msg1=filesystem_restore_message, msg2="")
+                # SeekZilla differential partition: synthesize the full Partclone
+                # stream from Base + differential and pipe it into partclone.
+                is_rzdiff = (not self.is_cloning) and bool(
+                    self.image.image_format_dict_dict[image_key].get("is_rzdiff", False)
+                )
+                if is_rzdiff:
+                    rzdiff_outcome = self._restore_rzdiff_partition(
+                        image_key=image_key,
+                        dest_part=dest_part,
+                        env=env,
+                        total_size_estimate=total_size_estimate,
+                        image_number=image_number,
+                        filesystem_restore_message=filesystem_restore_message,
+                    )
+                    if rzdiff_outcome == "cancelled":
+                        return self.ui_manager.completed_operation(
+                            callable_fn=self.completed_restore,
+                            succeeded=False,
+                            message=_("User requested operation to stop."),
+                        )
+                    if rzdiff_outcome != "ok":
+                        continue
                 # Restore filesystem. Implements Clonezillas "unicast_restore_by_partclone", "unicast_restore_by_partimage", "unicast_restore_by_ntfsclone"
-                if "type" in self.image.image_format_dict_dict[image_key].keys():
+                elif "type" in self.image.image_format_dict_dict[image_key].keys():
                     image_type = self.image.image_format_dict_dict[image_key]["type"]
                     if image_type == "swap":
                         self.logger.write("Considering " + image_key + "\n")
@@ -2097,10 +2131,202 @@ class RestoreManager:
                         message=_("User requested operation to stop."),
                     )
 
+        rzdiff_failed = getattr(self, "rzdiff_failed_partitions", None)
+        if rzdiff_failed:
+            # A differential partition that could not be reconstructed from its
+            # Base image is never reported as a successful restore.
+            return self.ui_manager.completed_operation(
+                callable_fn=self.completed_restore,
+                succeeded=False,
+                message=_("Differential backup restore failed for: {partitions}").format(
+                    partitions=", ".join(rzdiff_failed)
+                ),
+            )
+
         # Return success!
         return self.ui_manager.completed_operation(
             callable_fn=self.completed_restore, succeeded=True, message=""
         )
+
+    def _restore_rzdiff_partition(
+        self,
+        image_key,
+        dest_part,
+        env,
+        total_size_estimate,
+        image_number,
+        filesystem_restore_message,
+    ):
+        """Restore one differential partition: diff_synthesizer stream | partclone.<fs> --restore.
+
+        Returns "ok", "failed" (already reported loudly) or "cancelled".
+        A missing / mismatching Base image fails this partition cleanly.
+        """
+        fmt_dict = self.image.image_format_dict_dict[image_key]
+        diff_dir = fmt_dict.get("diff_dir") or os.path.dirname(self.image.absolute_path)
+        short_prefix = fmt_dict.get("prefix", image_key)
+        dest_key = dest_part["dest_key"]
+
+        def _fail(details):
+            partition_summary = (
+                _(
+                    "Error restoring partition {image_key} to {destination_partition}."
+                ).format(image_key=image_key, destination_partition=dest_key)
+                + " (differential backup)\n"
+            )
+            if self.logger is not None:
+                self.logger.write(partition_summary + details + "\n")
+            self.ui_manager.display_error_message(
+                summary_message=partition_summary + "\n" + details
+            )
+            with self.summary_message_lock:
+                self.summary_message += partition_summary + details + "\n"
+            failed = getattr(self, "rzdiff_failed_partitions", None)
+            if failed is None:
+                failed = self.rzdiff_failed_partitions = []
+            failed.append(image_key)
+            return "failed"
+
+        base_dir, base_error = resolve_rzdiff_base_dir(diff_dir)
+        if base_dir is None:
+            return _fail(base_error)
+
+        restore_binary = fmt_dict.get("binary", "partclone." + str(fmt_dict.get("filesystem")))
+        if shutil.which(restore_binary) is None:
+            return _fail(
+                "Cannot restore "
+                + dest_key
+                + ": "
+                + restore_binary
+                + ": Not found\n\nPartition "
+                + image_key
+                + " cannot be restored unless this utility is installed."
+            )
+        valid_filename_dest_key = re.sub("/", "-", dest_key)
+        log_filepath = (
+            "/tmp/rescuezilla.logfile."
+            + valid_filename_dest_key
+            + "."
+            + restore_binary
+            + ".txt"
+        )
+        env = dict(env)
+        env.pop("TERM", None)
+        restore_command_list = (
+            [restore_binary]
+            + Utility.get_partclone_rescue_options(self.is_rescue)
+            + [
+                "--logfile",
+                log_filepath,
+                "--source",
+                "-",
+                "--restore",
+                "--overwrite",
+                dest_key,
+            ]
+        )
+        synth_cmd_list = build_rzdiff_synth_cmd_list(diff_dir, base_dir, short_prefix)
+        flat_command_string = Utility.print_cli_friendly(
+            "partclone (differential) command ", [synth_cmd_list, restore_command_list]
+        )
+        synth_key = "rzdiff_synth_" + image_key
+        restore_key = "partclone_restore_" + image_key
+        mapping = self.restore_mapping_dict.get(image_key, {})
+        synth_stderr_file = tempfile.TemporaryFile(mode="w+b")
+        try:
+            try:
+                synth_proc, restore_proc = spawn_rzdiff_pipeline(
+                    synth_cmd_list, restore_command_list, env, synth_stderr_file
+                )
+            except OSError as exc:
+                return _fail("Unable to start: " + flat_command_string + "\n" + str(exc))
+            # Registered so cancel_restore() terminates the synthesizer too.
+            self.proc[synth_key] = synth_proc
+            self.proc[restore_key] = restore_proc
+
+            proc_stderr = ""
+            while True:
+                if self.requested_stop:
+                    terminate_rzdiff_pipeline(restore_proc, synth_proc)
+                    return "cancelled"
+                output = restore_proc.stderr.readline()
+                proc_stderr += output
+                if not output and restore_proc.poll() is not None:
+                    break
+                if output:
+                    temp_dict = Partclone.parse_partclone_output(output)
+                    if "completed" in temp_dict.keys():
+                        total_progress_float = Utility.calculate_progress_ratio(
+                            current_partition_completed_percentage=temp_dict["completed"]
+                            / 100.0,
+                            current_partition_bytes=mapping.get("estimated_size_bytes", 0),
+                            cumulative_bytes=mapping.get("cumulative_bytes", 0),
+                            total_bytes=total_size_estimate,
+                            image_number=image_number,
+                            num_partitions=len(self.restore_mapping_dict.keys()),
+                        )
+                        self.ui_manager.update_progress_bar(fraction=total_progress_float)
+                    if "remaining" in temp_dict.keys():
+                        self.ui_manager.update_progress_status(
+                            message=filesystem_restore_message + "\n\n" + output
+                        )
+            stdout, stderr = restore_proc.communicate()
+            proc_stderr += stderr or ""
+            synth_rc = synth_proc.wait()
+            restore_rc = restore_proc.returncode
+            synth_stderr = read_rzdiff_synth_stderr(synth_stderr_file)
+        finally:
+            try:
+                synth_stderr_file.close()
+            except Exception:
+                pass
+
+        if self.logger is not None:
+            self.logger.write(
+                "Differential restore exit codes: diff_synthesizer="
+                + str(synth_rc)
+                + " "
+                + restore_binary
+                + "="
+                + str(restore_rc)
+                + "\nsynthesizer stderr: "
+                + synth_stderr
+                + "\npartclone output: "
+                + str(stdout)
+                + str(proc_stderr)
+            )
+        if self.requested_stop:
+            return "cancelled"
+        if synth_rc != 0 or restore_rc != 0:
+            details = ""
+            if synth_rc != 0:
+                # Exit 3/4/5 (base mismatch / base corruption / diff corruption)
+                # must always be surfaced: the partition content is NOT valid.
+                details += describe_rzdiff_synth_failure(synth_rc, synth_stderr) + "\n\n"
+            details += (
+                "The command used internally was:\n\n"
+                + flat_command_string
+                + "\n\n"
+                + restore_binary
+                + " exit code "
+                + str(restore_rc)
+                + ": "
+                + str(stdout)
+                + "\n"
+                + str(proc_stderr)
+            )
+            return _fail(details)
+
+        with self.summary_message_lock:
+            self.summary_message += (
+                _(
+                    "Successfully restored image partition {image} to {destination_partition}"
+                ).format(image=image_key, destination_partition=dest_key)
+                + " (differential, Base: "
+                + os.path.basename(os.path.normpath(base_dir))
+                + ").\n"
+            )
+        return "ok"
 
     def do_sfdisk_corrections(self, input_sfdisk_absolute_path):
         # Delete the last-lba line to fix ensure secondary GPT gets written to the correct place even when

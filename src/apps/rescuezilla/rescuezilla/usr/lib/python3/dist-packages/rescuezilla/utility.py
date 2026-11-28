@@ -6,6 +6,8 @@
 #   compression command helpers (GPL-3.0-or-later).
 #   Modified 2026-11-28 (Community Fork): Format-specific default seekable
 #   frame size and --print-stats option (GPL-3.0-or-later).
+#   Modified 2026-11-28 (Community Fork): SeekZilla `.rzbhash` filename and
+#   --bhash-output option (GPL-3.0-or-later).
 # ----------------------------------------------------------------------
 #   This program is free software: you can redistribute it and/or modify
 #   it under the terms of the GNU General Public License as published by
@@ -955,17 +957,25 @@ class Utility:
         return "Info-seekidx-" + short_device_node + ".rzidx"
 
     @staticmethod
+    def get_bhash_index_filename(short_device_node):
+        """Return the SeekZilla block-hash index filename (`Info-*` prefix, glob-safe)."""
+        return "Info-bhash-" + short_device_node + ".rzbhash"
+
+    @staticmethod
     def get_seekable_compression_cmd_list(
         format,
         level_integer,
         index_output_path,
         frame_size=None,
         print_stats=False,
+        bhash_output_path=None,
     ):
         """Return command list that produces RFC-compliant seekable gzip/zstd + .rzidx.
 
         frame_size=None selects 4 MiB for zstd and 1 MiB for gzip.
         print_stats=True appends --print-stats (one telemetry line on stderr).
+        bhash_output_path additionally writes a Partclone `.rzbhash` block-hash
+        index (skipped automatically for non-Partclone streams such as dd).
         """
         if format in ("gzip", "zstd"):
             if frame_size is None:
@@ -990,6 +1000,8 @@ class Utility:
             ]
             if print_stats:
                 cmd_list.append("--print-stats")
+            if bhash_output_path:
+                cmd_list.extend(["--bhash-output", bhash_output_path])
             return cmd_list
         return Utility.get_compression_cmd_list(format, level_integer)
 

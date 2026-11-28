@@ -141,8 +141,8 @@ fun StringToInteger (str) {
 # New background colour
 # #2c001e --> 0.16, 0.00, 0.12
 #
-Window.SetBackgroundTopColor (0.137, 0.216, 0.314);     # Nice colour on top of the screen fading to
-Window.SetBackgroundBottomColor (0.137, 0.216, 0.314);  # an equally nice colour on the bottom
+Window.SetBackgroundTopColor (0.059, 0.090, 0.165);     # SeekZilla Midnight Navy (#0F172A)
+Window.SetBackgroundBottomColor (0.059, 0.090, 0.165);  # SeekZilla Midnight Navy (#0F172A)
 
 bits_per_pixel = Window.GetBitsPerPixel ();
 if (bits_per_pixel == 4) {

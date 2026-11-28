@@ -295,7 +295,7 @@ def launch_gui(human_readable_version: str):
     # [1] Adapted from: https://github.com/zim-desktop-wiki/zim-desktop-wiki/blob/master/zim/gui/widgets.py
     banner_image_eventbox = builder.get_object("banner_image_eventbox")
     # Set the custom CSS using the GTK 'name' attribute (note this is different to the 'id' attribute)
-    css_text = "#banner { background-color: #345278; }"
+    css_text = "#banner { background-color: #0F172A; }"
     css_provider = Gtk.CssProvider()
     css_provider.load_from_data(css_text.encode("UTF-8"))
     banner_style = banner_image_eventbox.get_style_context()

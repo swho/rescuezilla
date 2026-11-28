@@ -379,7 +379,7 @@ do
 done
 
 cat << EOF > image/README.diskdefines
-#define DISKNAME Rescuezilla
+#define DISKNAME SeekZilla
 #define TYPE binary
 #define TYPEbinary 1
 #define ARCH $ARCH
@@ -534,7 +534,7 @@ xorrisofs_args=(
                # Output image path
                --output "$BUILD_DIRECTORY/$RESCUEZILLA_ISO_FILENAME"
                # Set filesystem volume ID
-               --volid "Rescuezilla"
+               --volid "SeekZilla"
                # "Enable Rock Ridge and set user and group id of all files in the ISO image to 0." (prevents files in the ISO image using uid/gid of
                # the user running the build. Also "Grant r-permissions to all. Deny all w-permissions. If any x-permission is set, grant x-permission to all.
                # Remove s-bit and t-bit". This does not affect the Linux root filesystem as it is squashfs-compressed so carries its own file attributes.

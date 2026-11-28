@@ -7,6 +7,10 @@
 #   wiring (GPL-3.0-or-later).
 #   Modified 2026-11-28 (Community Fork): zstd (level 3) is now the default
 #   GUI compression format (GPL-3.0-or-later).
+#   Modified 2026-11-28 (Community Fork): SeekZilla differential backup
+#   selection (base image discovery, Browse..., confirmation text) and
+#   "-img-seekzilla" / "-diff-seekzilla" default folder names
+#   (GPL-3.0-or-later).
 # ----------------------------------------------------------------------
 #   This program is free software: you can redistribute it and/or modify
 #   it under the terms of the GNU General Public License as published by
@@ -65,6 +69,199 @@ import gi
 
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, GObject  # noqa: E402
+
+# SeekZilla default backup folder suffixes (full / differential)
+SEEKZILLA_FULL_FOLDER_SUFFIX = "-img-seekzilla"
+SEEKZILLA_DIFF_FOLDER_SUFFIX = "-diff-seekzilla"
+
+
+def discover_compatible_base_images(parent_dir, drive_keys, drive_state):
+    """Find full SeekZilla images in `parent_dir` usable as a differential base.
+
+    Pure logic (stdlib only, no GTK): scans the immediate subdirectories of
+    `parent_dir` for full backups that contain at least one
+    `Info-bhash-*.rzbhash` and are NOT differential backups themselves (no
+    `Info-rzdiff-manifest.json`).
+
+    - One selected drive: every folder whose `disk` file lists the drive, whose
+      name ends with `-<drive>`, or whose `.rzbhash` partitions belong to the
+      drive is a candidate.
+    - Several selected drives: sibling folders of a multi-drive backup
+      (`<name>-<drive>`, e.g. `2026-11-27-1606-img-rescuezilla-nvme0n1` and
+      `...-nvme1n1`) are grouped by their common name, or by their timestamp
+      prefix / `disk` file when the names were changed.
+
+    Returns a list of dicts (complete matches first, then newest first) with
+    keys: label, name, base_dir, base_dirs_by_drive, missing_drives,
+    matched_partitions, is_multi_drive, mtime.
+    """
+    import collections as _collections
+    import os as _os
+    import re as _re
+
+    manifest_name = "Info-rzdiff-manifest.json"
+    bhash_prefix = "Info-bhash-"
+    bhash_suffix = ".rzbhash"
+    ts_re = _re.compile(r"^(\d{4}-\d{2}-\d{2}-\d{4})")
+
+    def _short_drive(dk):
+        short = _re.sub(r"^/dev/", "", str(dk).strip())
+        short = _re.sub(r"[^A-Za-z0-9._-]+", "_", short).strip("._-")
+        return short or "disk"
+
+    def _short_partition(pk):
+        return _re.sub("/", "-", _re.sub(r"^/dev/", "", str(pk).strip()))
+
+    if isinstance(drive_keys, str):
+        keys = [drive_keys]
+    else:
+        keys = list(drive_keys or [])
+    if not parent_dir or not keys or not _os.path.isdir(parent_dir):
+        return []
+
+    shorts = _collections.OrderedDict((dk, _short_drive(dk)) for dk in keys)
+    part_shorts = {}
+    for dk in keys:
+        parts = {}
+        if isinstance(drive_state, dict) and isinstance(drive_state.get(dk), dict):
+            parts = drive_state[dk].get("partitions") or {}
+        part_shorts[dk] = {_short_partition(pk) for pk in parts}
+
+    try:
+        names = sorted(_os.listdir(parent_dir))
+    except OSError:
+        return []
+    folders = []
+    for name in names:
+        path = _os.path.join(parent_dir, name)
+        if not _os.path.isdir(path):
+            continue
+        try:
+            entries = set(_os.listdir(path))
+        except OSError:
+            continue
+        if manifest_name in entries or any(
+            e.endswith("-rzdiff.meta") or "-rzdiff-img." in e for e in entries
+        ):
+            continue  # differential (or partial differential) backups are never used as a base
+        bhash_parts = sorted(
+            e[len(bhash_prefix) : -len(bhash_suffix)]
+            for e in entries
+            if e.startswith(bhash_prefix)
+            and e.endswith(bhash_suffix)
+            and len(e) > len(bhash_prefix) + len(bhash_suffix)
+        )
+        if not bhash_parts:
+            continue
+        disks = []
+        if "disk" in entries:
+            try:
+                with open(_os.path.join(path, "disk"), "r", encoding="utf-8", errors="replace") as fh:
+                    disks = fh.read().split()
+            except OSError:
+                disks = []
+        try:
+            mtime = _os.path.getmtime(path)
+        except OSError:
+            mtime = 0.0
+        folders.append(
+            {"name": name, "path": path, "bhash_parts": bhash_parts, "disks": disks, "mtime": mtime}
+        )
+
+    def _suffix_match(folder, dk):
+        return folder["name"].endswith("-" + shorts[dk])
+
+    def _content_match(folder, dk):
+        if shorts[dk] in folder["disks"]:
+            return True
+        if not folder["disks"]:
+            return bool(part_shorts[dk] & set(folder["bhash_parts"]))
+        return False
+
+    def _matched_partitions(folder, dk):
+        return sorted(part_shorts[dk] & set(folder["bhash_parts"]))
+
+    results = []
+    if len(keys) == 1:
+        dk = keys[0]
+        for folder in folders:
+            if not (_suffix_match(folder, dk) or _content_match(folder, dk)):
+                continue
+            results.append(
+                {
+                    "label": folder["name"],
+                    "name": folder["name"],
+                    "base_dir": folder["path"],
+                    "base_dirs_by_drive": {dk: folder["path"]},
+                    "missing_drives": [],
+                    "matched_partitions": {dk: _matched_partitions(folder, dk)},
+                    "is_multi_drive": False,
+                    "mtime": folder["mtime"],
+                }
+            )
+        results.sort(key=lambda c: (-c["mtime"], c["name"]))
+        return results
+
+    # Multi-drive: group sibling folders.
+    groups = _collections.OrderedDict()
+    used = set()
+    for folder in folders:  # pass 1: "<name>-<drive>" siblings
+        for dk in keys:
+            if _suffix_match(folder, dk):
+                gkey = folder["name"][: -(len(shorts[dk]) + 1)]
+                group = groups.setdefault(gkey, _collections.OrderedDict())
+                if dk not in group:
+                    group[dk] = folder
+                    used.add(folder["path"])
+                break
+    for folder in folders:  # pass 2: renamed siblings matched by disk file / partitions
+        if folder["path"] in used:
+            continue
+        for dk in keys:
+            if not _content_match(folder, dk):
+                continue
+            m = ts_re.match(folder["name"])
+            ts = m.group(1) if m else None
+            target = None
+            if ts is not None:
+                for gkey, group in groups.items():
+                    if gkey.startswith(ts) and dk not in group:
+                        target = gkey
+                        break
+            if target is None:
+                target = ts if ts is not None else folder["name"]
+            group = groups.setdefault(target, _collections.OrderedDict())
+            if dk not in group:
+                group[dk] = folder
+                used.add(folder["path"])
+                break
+
+    total = len(keys)
+    for gkey, group in groups.items():
+        by_drive = _collections.OrderedDict(
+            (dk, group[dk]["path"]) for dk in keys if dk in group
+        )
+        if not by_drive:
+            continue
+        missing = [dk for dk in keys if dk not in group]
+        results.append(
+            {
+                "label": "{name} ({found}/{total} drives)".format(
+                    name=gkey, found=len(by_drive), total=total
+                ),
+                "name": gkey,
+                "base_dir": next(iter(by_drive.values())),
+                "base_dirs_by_drive": dict(by_drive),
+                "missing_drives": missing,
+                "matched_partitions": {
+                    dk: _matched_partitions(group[dk], dk) for dk in by_drive
+                },
+                "is_multi_drive": True,
+                "mtime": max(group[dk]["mtime"] for dk in by_drive),
+            }
+        )
+    results.sort(key=lambda c: (len(c["missing_drives"]), -c["mtime"], c["name"]))
+    return results
 
 
 class Handler:
@@ -153,6 +350,9 @@ class Handler:
         )
         compression_format_combobox.set_active(0)
         self.compression_tool_changed(compression_format_combobox)
+
+        # SeekZilla: optional differential backup selection on the compression page
+        self._init_differential_backup_ui()
 
         backup_ui_manager = GtkUiManager(
             builder=builder,
@@ -404,6 +604,7 @@ class Handler:
         self.selected_drives_meta = collections.OrderedDict()
         self.partitions_to_backup_by_drive = collections.OrderedDict()
         self.dest_dirs_by_drive = collections.OrderedDict()
+        self._reset_differential_backup_selection()
         self.drive_list_store.clear()
         self.drive_query.start_query(self._display_error_message_callback)
         self.main_statusbar.pop(self.main_statusbar.get_context_id("version"))
@@ -638,7 +839,8 @@ class Handler:
                     )
                 elif self.current_page == Page.BACKUP_DESTINATION_FOLDER:
                     enduser_date = (
-                        datetime.today().strftime("%Y-%m-%d-%H%M") + "-img-rescuezilla"
+                        datetime.today().strftime("%Y-%m-%d-%H%M")
+                        + SEEKZILLA_FULL_FOLDER_SUFFIX
                     )
                     self.builder.get_object("backup_name").set_text(enduser_date)
                     self.current_page = Page.BACKUP_IMAGE_NAME_SELECTION
@@ -669,21 +871,37 @@ class Handler:
                         print("User selected: " + str(list(planned_dest_dirs.values())))
                         self.dest_dir = dest_dir
                         self.dest_dirs_by_drive = planned_dest_dirs
+                        self.backup_parent_dir = selected_directory
+                        self.backup_folder_name = folder_name
                         self.backup_notes = self.builder.get_object(
                             "backup_notes"
                         ).get_text()
                         self.current_page = Page.BACKUP_COMPRESSION_CUSTOMIZATION
                         self.builder.get_object("backup_tabs").set_current_page(5)
+                        # Offer the full images in the destination folder as diff bases
+                        self.refresh_differential_base_images()
                 elif self.current_page == Page.BACKUP_COMPRESSION_CUSTOMIZATION:
-                    self.compression_dict = self.get_compression_dict()
-                    self.confirm_backup_configuration()
-                    self.current_page = Page.BACKUP_CONFIRM_CONFIGURATION
-                    self.builder.get_object("backup_tabs").set_current_page(6)
+                    diff_selection, diff_error = self.get_differential_backup_selection()
+                    if diff_error is not None:
+                        ErrorMessageModalPopup(self.builder, diff_error)
+                    else:
+                        self.diff_selection = diff_selection
+                        self._apply_backup_mode_folder_name(diff_selection is not None)
+                        self.compression_dict = self.get_compression_dict()
+                        self.confirm_backup_configuration()
+                        self.current_page = Page.BACKUP_CONFIRM_CONFIGURATION
+                        self.builder.get_object("backup_tabs").set_current_page(6)
                 elif self.current_page == Page.BACKUP_CONFIRM_CONFIGURATION:
                     self.current_page = Page.BACKUP_PROGRESS
                     self.builder.get_object("backup_tabs").set_current_page(7)
                     self.backup_manager.ui_manager.update_progress_bar(fraction=0)
                     is_rescue = self.get_rescue_state()
+                    diff_selection = getattr(self, "diff_selection", None)
+                    diff_base_dirs_by_drive = None
+                    if diff_selection is not None:
+                        diff_base_dirs_by_drive = dict(
+                            diff_selection.get("base_dirs_by_drive") or {}
+                        )
                     if len(self.active_backup_drive_keys) > 1:
                         backup_jobs = [
                             (
@@ -700,8 +918,14 @@ class Handler:
                             compression_dict=self.compression_dict,
                             is_rescue=is_rescue,
                             completed_backup_callback=self._on_operation_completed_callback,
+                            diff_base_dirs_by_drive=diff_base_dirs_by_drive,
                         )
                     else:
+                        diff_base_dir = None
+                        if diff_selection is not None:
+                            diff_base_dir = (diff_base_dirs_by_drive or {}).get(
+                                self.selected_drive_key
+                            ) or diff_selection.get("base_dir")
                         self.backup_manager.start_backup(
                             self.selected_drive_key,
                             self.partitions_to_backup,
@@ -713,6 +937,7 @@ class Handler:
                             self.compression_dict,
                             is_rescue,
                             self._on_operation_completed_callback,
+                            diff_base_dir=diff_base_dir,
                         )
                     # Disable back/next button until the restore completes
                     self.builder.get_object("button_next").set_sensitive(False)
@@ -2105,6 +2330,312 @@ class Handler:
         else:
             self.image_folder_query.query_folder(text)
 
+    # ------------------------------------------------------------------
+    # SeekZilla differential backup selection (compression page)
+    # ------------------------------------------------------------------
+
+    def _init_differential_backup_ui(self):
+        """Append the "Differential Backup (Optional)" frame to the compression page.
+
+        Built programmatically (no Glade widget IDs change); silently skipped
+        when the container widget is absent (e.g. minimal test builders).
+        """
+        self.diff_selection = None
+        self.diff_base_candidates = []
+        self.diff_custom_candidate = None
+        self.diff_checkbutton = None
+        self.diff_base_combobox = None
+        self.diff_browse_button = None
+        self.diff_status_label = None
+        try:
+            container = self.builder.get_object("backup_step7_content_vbox2")
+        except Exception:
+            container = None
+        if container is None or not hasattr(container, "pack_start"):
+            return
+        try:
+            frame = Gtk.Frame(label=_("Differential Backup (Optional)"))
+            vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            vbox.set_border_width(8)
+            checkbutton = Gtk.CheckButton(
+                label=_(
+                    "Differential backup against an existing full base image (only store changed 1 MiB blocks)"
+                )
+            )
+            hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            combobox = Gtk.ComboBoxText()
+            combobox.set_hexpand(True)
+            browse_button = Gtk.Button(label=_("Browse..."))
+            hbox.pack_start(combobox, True, True, 0)
+            hbox.pack_start(browse_button, False, False, 0)
+            status_label = Gtk.Label()
+            status_label.set_xalign(0.0)
+            status_label.set_line_wrap(True)
+            vbox.pack_start(checkbutton, False, False, 0)
+            vbox.pack_start(hbox, False, False, 0)
+            vbox.pack_start(status_label, False, False, 0)
+            frame.add(vbox)
+            container.pack_start(frame, False, False, 6)
+            when_ready_label = self.builder.get_object("backup_step6_when_ready_label")
+            if when_ready_label is not None and when_ready_label.get_parent() is container:
+                children = container.get_children()
+                if when_ready_label in children:
+                    container.reorder_child(frame, children.index(when_ready_label))
+            checkbutton.connect("toggled", self._on_differential_toggled)
+            combobox.connect("changed", self._on_differential_base_changed)
+            browse_button.connect("clicked", self._on_differential_browse_clicked)
+            frame.show_all()
+            self.diff_checkbutton = checkbutton
+            self.diff_base_combobox = combobox
+            self.diff_browse_button = browse_button
+            self.diff_status_label = status_label
+            self._update_differential_widgets()
+        except Exception:
+            traceback.print_exc()
+            self.diff_checkbutton = None
+            self.diff_base_combobox = None
+            self.diff_browse_button = None
+            self.diff_status_label = None
+
+    def _reset_differential_backup_selection(self):
+        self.diff_selection = None
+        self.diff_custom_candidate = None
+        self.diff_base_candidates = []
+        checkbutton = getattr(self, "diff_checkbutton", None)
+        if checkbutton is not None:
+            checkbutton.set_active(False)
+        combobox = getattr(self, "diff_base_combobox", None)
+        if combobox is not None:
+            combobox.remove_all()
+        self._update_differential_widgets()
+
+    def _get_backup_drive_keys(self):
+        keys = list(getattr(self, "active_backup_drive_keys", None) or [])
+        if not keys and getattr(self, "selected_drive_key", None):
+            keys = [self.selected_drive_key]
+        return keys
+
+    def _get_backup_parent_dir(self):
+        parent_dir = getattr(self, "backup_parent_dir", None)
+        if parent_dir:
+            return parent_dir
+        label = self.builder.get_object("backup_folder_label")
+        return label.get_text() if label is not None else ""
+
+    def refresh_differential_base_images(self):
+        """Re-discover compatible base images in the destination folder."""
+        drive_state = getattr(getattr(self, "drive_query", None), "drive_state", None) or {}
+        try:
+            candidates = discover_compatible_base_images(
+                self._get_backup_parent_dir(), self._get_backup_drive_keys(), drive_state
+            )
+        except Exception:
+            traceback.print_exc()
+            candidates = []
+        custom = getattr(self, "diff_custom_candidate", None)
+        if custom is not None:
+            candidates = [custom] + [
+                c for c in candidates if c.get("base_dir") != custom.get("base_dir")
+            ]
+        self.diff_base_candidates = candidates
+        combobox = getattr(self, "diff_base_combobox", None)
+        if combobox is not None:
+            combobox.remove_all()
+            for candidate in candidates:
+                combobox.append_text(candidate["label"])
+            if candidates:
+                combobox.set_active(0)
+        self._update_differential_widgets()
+
+    def _update_differential_widgets(self):
+        checkbutton = getattr(self, "diff_checkbutton", None)
+        if checkbutton is None:
+            return
+        is_active = checkbutton.get_active()
+        candidates = getattr(self, "diff_base_candidates", None) or []
+        if self.diff_base_combobox is not None:
+            self.diff_base_combobox.set_sensitive(is_active and len(candidates) > 0)
+        if self.diff_browse_button is not None:
+            self.diff_browse_button.set_sensitive(is_active)
+        if self.diff_status_label is None:
+            return
+        if not is_active:
+            text = _(
+                "Full backup: seekable index + 1 MiB block-hash (.rzbhash), usable as a future differential base."
+            )
+        elif not candidates:
+            text = _(
+                "No compatible full base image (with .rzbhash) found in {folder}. Use Browse... to select one."
+            ).format(folder=self._get_backup_parent_dir())
+        else:
+            selection, _error = self.get_differential_backup_selection()
+            text = ""
+            if selection is not None and selection.get("missing_drives"):
+                text = _(
+                    "No base image for: {drives} (these drives get a full backup)."
+                ).format(drives=", ".join(selection["missing_drives"]))
+            if not text:
+                text = _(
+                    "Partitions that are incompatible with the base (resized, other filesystem, partclone.dd) are saved as full images automatically."
+                )
+        self.diff_status_label.set_text(text)
+
+    def _on_differential_toggled(self, toggle_button):
+        if toggle_button.get_active() and not (getattr(self, "diff_base_candidates", None) or []):
+            self.refresh_differential_base_images()
+        self._update_differential_widgets()
+
+    def _on_differential_base_changed(self, combobox):
+        self._update_differential_widgets()
+
+    def _build_custom_base_candidate(self, chosen_dir):
+        """Candidate dict for a user-chosen base folder, or None if it is unusable."""
+        if not chosen_dir or not os.path.isdir(chosen_dir):
+            return None
+        drive_keys = self._get_backup_drive_keys()
+        drive_state = getattr(getattr(self, "drive_query", None), "drive_state", None) or {}
+        parent_dir = os.path.dirname(os.path.normpath(chosen_dir))
+        try:
+            discovered = discover_compatible_base_images(parent_dir, drive_keys, drive_state)
+        except Exception:
+            traceback.print_exc()
+            discovered = []
+        norm_chosen = os.path.normpath(chosen_dir)
+        for candidate in discovered:
+            if norm_chosen in [os.path.normpath(p) for p in candidate["base_dirs_by_drive"].values()]:
+                found = dict(candidate)
+                found["label"] = candidate["label"] + " " + _("(selected)")
+                return found
+        try:
+            entries = os.listdir(chosen_dir)
+        except OSError:
+            return None
+        if "Info-rzdiff-manifest.json" in entries:
+            return None
+        if not any(e.startswith("Info-bhash-") and e.endswith(".rzbhash") for e in entries):
+            return None
+        # Not matched to a drive by name/disk file: offer it to every drive;
+        # partitions without a matching .rzbhash fall back to full backups.
+        return {
+            "label": os.path.basename(norm_chosen) + " " + _("(selected)"),
+            "name": os.path.basename(norm_chosen),
+            "base_dir": chosen_dir,
+            "base_dirs_by_drive": {dk: chosen_dir for dk in drive_keys},
+            "missing_drives": [],
+            "matched_partitions": {},
+            "is_multi_drive": len(drive_keys) > 1,
+            "mtime": 0.0,
+        }
+
+    def _on_differential_browse_clicked(self, button):
+        dialog = Gtk.FileChooserDialog(
+            title=_("Select the full base image folder"),
+            parent=self.builder.get_object("main_window"),
+            action=Gtk.FileChooserAction.SELECT_FOLDER,
+        )
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OPEN, Gtk.ResponseType.OK
+        )
+        start_dir = self._get_backup_parent_dir()
+        if start_dir and os.path.isdir(start_dir):
+            dialog.set_current_folder(start_dir)
+        chosen_dir = None
+        try:
+            if dialog.run() == Gtk.ResponseType.OK:
+                chosen_dir = dialog.get_filename()
+        finally:
+            dialog.destroy()
+        if not chosen_dir:
+            return
+        candidate = self._build_custom_base_candidate(chosen_dir)
+        if candidate is None:
+            ErrorMessageModalPopup(
+                self.builder,
+                _(
+                    "The selected folder cannot be used as a differential base: {folder}\n\nA base must be a full SeekZilla backup containing Info-bhash-*.rzbhash files (and must not be a differential backup itself)."
+                ).format(folder=chosen_dir),
+            )
+            return
+        self.diff_custom_candidate = candidate
+        self.refresh_differential_base_images()
+        if self.diff_checkbutton is not None:
+            self.diff_checkbutton.set_active(True)
+        if self.diff_base_combobox is not None and self.diff_base_candidates:
+            self.diff_base_combobox.set_active(0)
+        self._update_differential_widgets()
+
+    def get_differential_backup_selection(self):
+        """Return (candidate_dict_or_None, error_message_or_None)."""
+        checkbutton = getattr(self, "diff_checkbutton", None)
+        if checkbutton is None or not checkbutton.get_active():
+            return None, None
+        candidates = getattr(self, "diff_base_candidates", None) or []
+        combobox = getattr(self, "diff_base_combobox", None)
+        index = combobox.get_active() if combobox is not None else -1
+        if not candidates or index is None or index < 0 or index >= len(candidates):
+            return None, _(
+                "Differential backup is enabled, but no base image is selected.\n\nSelect a full SeekZilla backup (with .rzbhash files) using Browse..., or untick the differential backup option."
+            )
+        return candidates[index], None
+
+    def _apply_backup_mode_folder_name(self, is_differential):
+        """Use "-diff-seekzilla" instead of the default "-img-seekzilla" folder suffix."""
+        parent_dir = getattr(self, "backup_parent_dir", None)
+        folder_name = getattr(self, "backup_folder_name", None)
+        if parent_dir is None or folder_name is None:
+            return
+        new_name = folder_name
+        if is_differential and folder_name.endswith(SEEKZILLA_FULL_FOLDER_SUFFIX):
+            new_name = (
+                folder_name[: -len(SEEKZILLA_FULL_FOLDER_SUFFIX)]
+                + SEEKZILLA_DIFF_FOLDER_SUFFIX
+            )
+        dest_dir = os.path.join(parent_dir, new_name)
+        planned_dest_dirs = compute_backup_dest_dirs(dest_dir, self.active_backup_drive_keys)
+        if new_name != folder_name and any(
+            os.path.exists(d) for d in planned_dest_dirs.values()
+        ):
+            # Keep the (already validated) user-chosen name instead.
+            dest_dir = os.path.join(parent_dir, folder_name)
+            planned_dest_dirs = compute_backup_dest_dirs(
+                dest_dir, self.active_backup_drive_keys
+            )
+        self.dest_dir = dest_dir
+        self.dest_dirs_by_drive = planned_dest_dirs
+
+    def get_backup_mode_markup(self):
+        """Pango markup line describing the full / differential backup mode."""
+        heading = GObject.markup_escape_text(_("Backup Mode:"))
+        selection = getattr(self, "diff_selection", None)
+        compression_format = (getattr(self, "compression_dict", None) or {}).get("format")
+        if selection is None:
+            if compression_format in ("zstd", "gzip"):
+                mode = _("Full (Seekable Index + 1 MiB Block-Hash)")
+            else:
+                mode = _("Full")
+            return "<b>" + heading + "</b> " + GObject.markup_escape_text(mode)
+        base_names = []
+        for dk, path in (selection.get("base_dirs_by_drive") or {}).items():
+            base_names.append(
+                (dk + ": " if len(selection.get("base_dirs_by_drive")) > 1 else "")
+                + os.path.basename(os.path.normpath(path))
+            )
+        mode = _("Differential (Base: {base})").format(base=", ".join(base_names))
+        text = "<b>" + heading + "</b> " + GObject.markup_escape_text(mode)
+        if selection.get("missing_drives"):
+            text += "\n" + GObject.markup_escape_text(
+                _("No base image for: {drives} (full backup)").format(
+                    drives=", ".join(selection["missing_drives"])
+                )
+            )
+        if compression_format not in ("zstd", "gzip"):
+            text += "\n" + GObject.markup_escape_text(
+                _(
+                    "Differential backup requires zstd or gzip compression; partitions will be saved as full images."
+                )
+            )
+        return text
+
     def confirm_backup_configuration(self):
         description = GObject.markup_escape_text(self.destination_partition_description)
         compression_string = (
@@ -2116,6 +2647,7 @@ class Handler:
             + _("Compression level: ")
             + str(self.compression_dict["level"])
         )
+        compression_string += "\n" + self.get_backup_mode_markup()
         source_drive_heading = GObject.markup_escape_text(_("Source drive"))
         backup_partitions_heading = GObject.markup_escape_text(
             _("Backing up the following partition(s)")

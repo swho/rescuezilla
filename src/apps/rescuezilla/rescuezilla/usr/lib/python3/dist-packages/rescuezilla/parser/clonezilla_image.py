@@ -1,6 +1,9 @@
 # ----------------------------------------------------------------------
 #   Copyright (C) 2003-2025 Steven Shiau <steven _at_ clonezilla org>
 #   Copyright (C) 2020-2025 Rescuezilla.com <rescuezilla@gmail.com>
+#   Modified 2026-11-28 (Community Fork): SeekZilla differential (rzdiff)
+#   partition detection and Info-rzdiff-manifest.json loading
+#   (GPL-3.0-or-later).
 # ----------------------------------------------------------------------
 #   This program is free software: you can redistribute it and/or modify
 #   it under the terms of the GNU General Public License as published by
@@ -36,6 +39,27 @@ from parser.proc_mdstat import ProcMdstat
 from parser.sfdisk import Sfdisk
 from parser.swappt import Swappt
 from utility import Utility, _
+
+# SeekZilla differential partition image: "sda1.ext4-rzdiff-img.zst.aa" + "sda1.ext4-rzdiff.meta"
+RZDIFF_COMPRESSION_SUFFIX_TO_FORMAT = {
+    "gz": "gzip",
+    "zst": "zstd",
+    "uncomp": "uncompressed",
+}
+
+
+def _load_rzdiff_manifest(dir):
+    """Return (manifest_or_None, error_message_or_None); never raises."""
+    try:
+        import diff_format
+    except Exception as exc:  # pragma: no cover - module ships with SeekZilla
+        return None, "Unable to load differential backup support: " + str(exc)
+    try:
+        return diff_format.load_diff_manifest(dir), None
+    except diff_format.DiffFormatError as exc:
+        return None, str(exc)
+    except Exception as exc:
+        return None, "Unable to read differential manifest: " + str(exc)
 
 
 # Clonezilla images can be created by Clonezilla using its 'savedisk' and 'saveparts' functions. See the official
@@ -198,6 +222,18 @@ class ClonezillaImage:
         self.enduser_drive_number = enduser_drive_number
         self.user_notes = ""
         self.warning_dict = {}
+
+        # SeekZilla differential backup folder (Info-rzdiff-manifest.json). A corrupt
+        # manifest must never break image scanning: it is reported as a warning.
+        self.rzdiff_manifest = None
+        self.is_rzdiff_image = False
+        if not is_needs_decryption:
+            self.rzdiff_manifest, rzdiff_error = _load_rzdiff_manifest(dir)
+            if rzdiff_error is not None:
+                self.warning_dict["rzdiff_manifest"] = (
+                    "Differential backup manifest is invalid: " + rzdiff_error
+                )
+            self.is_rzdiff_image = self.rzdiff_manifest is not None
 
         notes_filepath = os.path.join(dir, "rescuezilla.description.txt")
         if os.path.exists(notes_filepath):
@@ -461,7 +497,11 @@ class ClonezillaImage:
                 self.image_format_dict_dict[short_partition_device_node] = (
                     image_format_dict
                 )
-                if (
+                if image_format_dict.get("is_rzdiff", False):
+                    # A differential partition has no standalone Partclone image
+                    # (partclone.info cannot read it); it needs its base image.
+                    self.is_rzdiff_image = True
+                elif (
                     not self.has_partition_table()
                     and image_format_dict["type"] == "partclone"
                 ):
@@ -557,6 +597,16 @@ class ClonezillaImage:
             int(self.size_bytes)
         )
 
+        if any(
+            fmt_dict.get("is_rzdiff", False)
+            for fmt_dict in self.image_format_dict_dict.values()
+        ):
+            self.is_rzdiff_image = True
+        if self.is_rzdiff_image:
+            # Distinguish differential images (which need their base) in the
+            # Restore / Verify / Image Explorer image lists.
+            self.enduser_filename = self.enduser_filename + " [Diff]"
+
         pp = pprint.PrettyPrinter(indent=4)
         pp.pprint(self.image_format_dict_dict)
 
@@ -572,6 +622,60 @@ class ClonezillaImage:
         # It's not guaranteed the wildcard returns in alphabetical order, so we sort it (alphabetically, not lexically).
         glob_list.sort()
         return glob_list
+
+    @staticmethod
+    def scan_rzdiff_image(dir, prefix):
+        """Detect a SeekZilla differential partition `<prefix>.<fs>-rzdiff-img.<comp>.aa`.
+
+        Requires the matching `<prefix>.<fs>-rzdiff.meta`. Returns an
+        image_format_dict (type "partclone", is_rzdiff True) or {}.
+        """
+        pattern = re.compile(
+            "^"
+            + re.escape(prefix)
+            + r"[.]([a-zA-Z0-9+]+)-rzdiff-img[.]([a-zA-Z0-9]+)[.]aa$"
+        )
+        try:
+            names = sorted(os.listdir(dir))
+        except OSError:
+            return {}
+        for name in names:
+            m = pattern.match(name)
+            if not m:
+                continue
+            filesystem = m.group(1)
+            comp_suffix = m.group(2)
+            meta_path = os.path.join(dir, prefix + "." + filesystem + "-rzdiff.meta")
+            if not isfile(meta_path):
+                print("Ignoring " + name + ": missing " + meta_path)
+                continue
+            split_prefix = name[:-2]
+            split_list = []
+            for candidate in names:
+                if candidate.startswith(split_prefix):
+                    suffix = candidate[len(split_prefix) :]
+                    if re.fullmatch(r"[a-z]{2,}", suffix) and isfile(
+                        os.path.join(dir, candidate)
+                    ):
+                        split_list.append(os.path.join(dir, candidate))
+            # GNU split order: aa..zz, then longer suffixes
+            split_list.sort(key=lambda p: (len(p), p))
+            compression = RZDIFF_COMPRESSION_SUFFIX_TO_FORMAT.get(comp_suffix)
+            if compression is None:
+                compression = Utility.detect_compression(split_list)
+            return {
+                "type": "partclone",
+                "is_rzdiff": True,
+                "diff_dir": dir,
+                "rzdiff_meta": meta_path,
+                "absolute_filename_glob_list": split_list,
+                "compression": compression,
+                "filesystem": filesystem,
+                "binary": "partclone." + filesystem,
+                "prefix": prefix,
+                "is_lvm_logical_volume": False,
+            }
+        return {}
 
     @staticmethod
     def scan_backup_image(dir, prefix, is_needs_decryption):
@@ -596,6 +700,7 @@ class ClonezillaImage:
                 os.path.join(dir, prefix + "[.][a-zA-Z][a-zA-Z]")
             )
         )
+        rzdiff_image_format_dict = ClonezillaImage.scan_rzdiff_image(dir, prefix)
         swap_partition_info_glob_list = glob.glob(
             os.path.join(dir, "swappt-" + prefix + ".info")
         )
@@ -643,6 +748,9 @@ class ClonezillaImage:
                     "prefix": prefix,
                     "is_lvm_logical_volume": False,
                 }
+        elif len(rzdiff_image_format_dict) > 0:
+            # SeekZilla differential partition (needs its base image to restore)
+            image_format_dict = rzdiff_image_format_dict
         # PartImage images have a much wider wildcard that will match the above formats, so it's important we test it last
         elif len(partimage_image_abs_path_glob_list) > 0:
             image_format_dict = {

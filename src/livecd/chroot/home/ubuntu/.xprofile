@@ -1,3 +1,9 @@
+# SeekZilla (Community Fork, 2026-11-28): cap 4K / HiDPI displays at a readable
+# 1080p (default) or 720p logical resolution BEFORE the desktop, panel and
+# Rescuezilla windows start. Override: boot with seekzilla_display=native|720p|1080p
+# or set SEEKZILLA_DISPLAY_MODE. Log: /tmp/seekzilla-display.log. Never fails login.
+/usr/local/bin/seekzilla-set-display-mode >/dev/null 2>&1 || true
+
 # Launch PCMan File Manager in desktop mode, to manage desktop icons and wallpaper
 pcmanfm --desktop &
 

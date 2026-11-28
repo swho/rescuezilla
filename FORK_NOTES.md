@@ -84,12 +84,24 @@ In full compliance with the upstream **GNU General Public License v3.0 or later
      - `diff_synthesizer.py merge` flattens Base + Diff atomically into a standalone stock-compatible full image (skipping symlinks/FIFOs via `lstat`+`O_NOFOLLOW`, fsyncing files & parent dir).
      - GTK3 Backup Step 7 (`handler.py`) discovers compatible Base images (including multi-drive sibling sets, skipping diff/partial-diff folders) and offers a clean Differential Backup toggle with `-diff-seekzilla` default naming.
 
+8. **v2.1 4K / HiDPI Live USB Display Readability (2026-11-28, tag `2.7.0-seekzilla-v2.1`)**:
+   - **Live Desktop Auto-Resolution (`src/livecd/chroot/usr/local/bin/seekzilla-set-display-mode`, `.xprofile`, `/etc/X11/Xsession.d/35seekzilla-hidpi`)**:
+     - Runs synchronously at the top of `~/.xprofile` (`>/dev/null 2>&1 || true`) before desktop/panel/SeekZilla launch, leaving `<= 1920×1200` (1080p, 720p, VMware 1280×800) and ultrawide 1080p-height (`2560×1080`, `3840×1080`) displays untouched.
+     - Automatically caps 4K (`3840×2160`), 4K+ (`3840×2400`), 5K, and >1080p displays with a 3-tier fail-safe strategy:
+       - **Tier 1 (Hardware mode)**: aspect-aware selection (`1920×1080` for 16:9, `1920×1200` for 16:10, `2560×1080` for 21:9, `3840×1080` for 32:9, or `1280×720` when overridden via `seekzilla_display=720p`), preserving mirrored/cloned outputs and non-overlapping multi-monitor `--pos`.
+       - **Tier 2 (Single-mode 4K eDP panel fallback)**: `xrandr --scale 0.5x0.5` (2× integer magnification to `1920×1080` logical screen).
+       - **Tier 3 (Fixed framebuffer / `efifb` / `vesa` fallback)**: `xrdb -merge` `Xft.dpi: 192` (`>= 3000px` wide) or `144` (`>= 2400px`) plus a per-user `0600` state file re-applied by `/etc/X11/Xsession.d/35seekzilla-hidpi` after `lightdm-session` merges `~/.Xresources` (immune to squashfs root-owned `~/.Xresources` races).
+     - Override via kernel cmdline `seekzilla_display=native|720p|1080p` or env `SEEKZILLA_DISPLAY_MODE`; always exits `0` in runtime mode so login can never break.
+   - **GRUB 4K Readability (`grub.cfg`, `boot_menu_background.png`)**:
+     - Updated `set gfxmode=1280x720,1024x768,1920x1080,800x600,auto` and re-rendered `boot_menu_background.png` at native `1280×720` (16:9) with a centered 4:3 crop-safe hero zone.
+   - **Companion `SeekZilla Browser`**: added GUI retroactive `Info-bhash-<part>.rzbhash` builder (`bhash_builder.py`, `BuildBhashWorker`, `BhashBuildDialog`, bit-for-bit verified against `block_hash.py` and real VM backups; **217 / 217 tests** passing).
+
 ## Current Verification Status
 
-- **Verified (`v2.0`, tag `2.7.0-seekzilla-v2.0`)**:
+- **Verified (`v2.1`, tag `2.7.0-seekzilla-v2.1`)**:
   - **Automated unit & integration suites**:
-    - Ubuntu 24.04 Noble Docker (`Python 3.12`): **137 / 137 tests passing** (`test_diff_engine.py`, `test_diff_integration.py`, `test_seekable_compressor.py`, `test_multi_drive_backup.py`, plus all upstream parser tests), `ruff check --select F` 0 errors, `msgfmt -c` 0 errors, `xmllint` & `desktop-file-validate` clean.
-    - Companion `SeekZilla Browser` (`rescuezilla-browser`): **181 / 181 tests passing** (including cross-repo `ForkInteropTest` and 16-thread × 3,000-read concurrent `LayeredPartitionDevice` stress test), `ruff check --select F` 0 errors.
+    - Ubuntu 24.04 Noble Docker (`Python 3.12`): **194 / 194 tests passing** (incl. 57 `test_display_mode.py` tests covering 4K/4K+/21:9/32:9/single-mode eDP/Tier 3 `Xsession.d` drop-in/cloned/multi-monitor/error isolation, plus all diff & upstream tests), `ruff check --select F` 0 errors, `sh -n` 0 errors, `msgfmt -c` 0 errors, `xmllint` & `desktop-file-validate` clean.
+    - Companion `SeekZilla Browser` (`rescuezilla-browser`): **217 / 217 tests passing** (incl. retroactive `.rzbhash` builder bit-for-bit cross-repo tests against `block_hash.py` & real VM `SeekZilla` Base backups, `ForkInteropTest`, and 16-thread concurrent `LayeredPartitionDevice` stress test), `ruff check --select F` 0 errors.
   - **Real VMware Workstation Live ISO v2.0 E2E (`Ubuntu 24.04 Noble`, real `partclone.vfat` / `partclone.btrfs` / `partclone.ntfs` / `partclone.restore` / `partclone.chkimg` / GTK3 / Openbox)**:
     - Live X11 boot verified auto-maximized `SeekZilla (Based on Rescuezilla)` (`1280×800`), Midnight Navy banner, icons, and GTK3 differential backup controls; GRUB boot screen verified via live QEMU framebuffer capture.
     - Disk 2 (`vfat` + `btrfs`) Full Base -> live V2 add/modify/delete mutations -> Differential backup (`494,511 B` = **`8.8%`** of `5,636,384 B` Base; Base folder verified 100% unmodified file-by-file mtime + SHA-256).

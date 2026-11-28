@@ -1,0 +1,16 @@
+# SeekZilla (Community Fork, 2026-11-28): re-apply Tier 3 Xft.dpi fallback
+# AFTER lightdm-session merges ~/.Xresources (which resets Xft.dpi to 100 and
+# may be root-owned in squashfs before rc-local finishes chown).
+_sz_uid=$(id -u 2>/dev/null || echo "")
+_sz_dpi_file=""
+if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "${XDG_RUNTIME_DIR}" ]; then
+    _sz_dpi_file="${XDG_RUNTIME_DIR}/seekzilla-xft-dpi"
+elif [ -n "$_sz_uid" ]; then
+    _sz_dpi_file="/tmp/seekzilla-xft-dpi.${_sz_uid}"
+fi
+if [ -n "$_sz_dpi_file" ] && [ -f "$_sz_dpi_file" ] && [ ! -L "$_sz_dpi_file" ] && [ -O "$_sz_dpi_file" ]; then
+    if command -v xrdb >/dev/null 2>&1; then
+        xrdb -merge "$_sz_dpi_file" >/dev/null 2>&1 || true
+    fi
+fi
+unset _sz_uid _sz_dpi_file

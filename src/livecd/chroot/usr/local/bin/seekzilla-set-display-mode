@@ -1,0 +1,729 @@
+#!/usr/bin/env python3
+# ----------------------------------------------------------------------
+#   seekzilla-set-display-mode: cap the SeekZilla Live USB desktop at a
+#   readable 1080p (default) or 720p logical resolution on 4K / HiDPI
+#   displays, leaving <=1080p, 720p and VMware (1280x800) displays alone.
+#
+#   Copyright (C) 2026 Rescuezilla Seekable-Index Community Fork Contributors
+#   Added 2026-11-28 (Community Fork): new file.
+# ----------------------------------------------------------------------
+#   This program is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation, either version 3 of the License, or
+#   (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# ----------------------------------------------------------------------
+"""Pick a readable logical resolution for the live X session.
+
+Override with the environment variable ``SEEKZILLA_DISPLAY_MODE`` or the
+kernel command line token ``seekzilla_display=<val>`` (environment wins):
+
+    native | off | 0   leave every output untouched
+    720p               cap outputs at 1280x800
+    1080p   (default)  cap outputs at 1920x1200
+
+Strategy per connected, active output that exceeds the cap:
+    Tier 1  switch to an advertised hardware mode within the cap
+            (``xrandr --output X --mode WxH``)
+    Tier 2  if no such mode exists (single-mode 4K eDP panels), zoom with
+            ``xrandr --output X --scale SxS``.  xrandr semantics: values
+            below 1 zoom in, e.g. ``--scale 0.5x0.5`` on a 3840x2160 mode
+            gives a 1920x1080 logical screen magnified 2x.
+    Tier 3  if xrandr mode/scale changes fail (efifb / vesa), raise ``Xft.dpi``
+            via ``xrdb -merge``, write a private per-user DPI state file
+            re-applied by ``/etc/X11/Xsession.d/35seekzilla-hidpi`` (after
+            LightDM merges ``~/.Xresources``), and best-effort update
+            ``~/.Xresources`` when writable.
+
+Runtime mode ALWAYS exits 0 so it can never break the login.  Only the
+explicit ``--check`` flag returns non-zero (1 when a change would be made).
+"""
+
+import os
+import re
+import subprocess
+import sys
+import time
+
+LOG_PATH = "/tmp/seekzilla-display.log"
+SUBPROCESS_TIMEOUT = 5
+
+PREF_NATIVE = "native"
+PREF_720P = "720p"
+PREF_1080P = "1080p"
+DEFAULT_PREF = PREF_1080P
+
+CAPS = {
+    PREF_1080P: (1920, 1200),
+    PREF_720P: (1280, 800),
+}
+
+# Tier 1 priority lists (width, height), tried in order.
+PRIORITY_1080P_16_10 = [(1920, 1200), (1920, 1080), (1680, 1050), (1440, 900), (1280, 800), (1280, 720)]
+PRIORITY_1080P_16_9 = [(1920, 1080), (1600, 900), (1366, 768), (1280, 720), (1920, 1200), (1280, 800)]
+PRIORITY_1080P_21_9 = [(2560, 1080), (1920, 1080), (1600, 900), (1280, 720)]
+PRIORITY_1080P_32_9 = [(3840, 1080), (2560, 1080), (1920, 1080), (1280, 720)]
+PRIORITY_720P = [(1280, 720), (1280, 800), (1366, 768), (1920, 1080)]
+PRIORITY_720P_21_9 = [(1680, 720), (1280, 720), (2560, 1080)]
+PRIORITY_720P_32_9 = [(2560, 720), (1280, 720), (3840, 1080)]
+
+# Aspect ratio thresholds (width / height).
+ASPECT_16_10_THRESHOLD = 1.68
+ASPECT_21_9_THRESHOLD = 2.0
+ASPECT_32_9_THRESHOLD = 3.0
+
+# Tier 1 generic fallback window for advertised modes.
+FALLBACK_MIN_W, FALLBACK_MAX_W = 1280, 1920
+FALLBACK_MIN_H, FALLBACK_MAX_H = 720, 1200
+
+_NATIVE_ALIASES = {"native", "off", "0", "none", "no", "false", "disable", "disabled"}
+_720P_ALIASES = {"720p", "720"}
+_1080P_ALIASES = {"1080p", "1080", "default", "auto", "on", "1", "yes", "true"}
+
+_HEADER_RE = re.compile(
+    r"^(?P<name>\S+)\s+(?P<state>connected|disconnected|unknown connection)"
+    r"(?P<primary>\s+primary)?"
+    r"(?:\s+(?P<w>\d+)x(?P<h>\d+)\+(?P<x>-?\d+)\+(?P<y>-?\d+))?"
+    r"(?:\s+(?P<rotation>normal|left|inverted|right)(?=\s|$))?"
+)
+_MODE_RE = re.compile(r"^\s+(?P<name>(?P<w>\d+)x(?P<h>\d+)(?P<rest>\S*))\s+(?P<rates>\d.*)$")
+_RATE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([*+]{0,2})")
+
+
+# ----------------------------------------------------------------------
+# Preference
+# ----------------------------------------------------------------------
+def normalize_preference(value):
+    """Map a user supplied value to a PREF_* constant; None if unrecognised."""
+    if value is None:
+        return None
+    v = str(value).strip().strip("\"'").lower()
+    if v in _NATIVE_ALIASES:
+        return PREF_NATIVE
+    if v in _720P_ALIASES:
+        return PREF_720P
+    if v in _1080P_ALIASES:
+        return PREF_1080P
+    return None
+
+
+def read_display_preference(environ=None, cmdline=None):
+    """Return (pref, source).  Env var beats /proc/cmdline beats default.
+
+    ``environ``: mapping (defaults to os.environ).
+    ``cmdline``: kernel command line text (defaults to /proc/cmdline).
+    Unrecognised values fall back to the default (1080p).
+    """
+    if environ is None:
+        environ = os.environ
+    env_val = environ.get("SEEKZILLA_DISPLAY_MODE")
+    if env_val is not None and env_val.strip() != "":
+        pref = normalize_preference(env_val)
+        if pref is not None:
+            return pref, "env SEEKZILLA_DISPLAY_MODE=%s" % env_val.strip()
+        return DEFAULT_PREF, "env SEEKZILLA_DISPLAY_MODE=%s unrecognised, using default" % env_val.strip()
+
+    if cmdline is None:
+        try:
+            with open("/proc/cmdline", "r", encoding="utf-8", errors="replace") as f:
+                cmdline = f.read()
+        except OSError:
+            cmdline = ""
+    token_val = None
+    for token in cmdline.split():
+        if token.startswith("seekzilla_display="):
+            token_val = token.split("=", 1)[1]  # last occurrence wins, like the kernel
+    if token_val is not None:
+        pref = normalize_preference(token_val)
+        if pref is not None:
+            return pref, "cmdline seekzilla_display=%s" % token_val
+        return DEFAULT_PREF, "cmdline seekzilla_display=%s unrecognised, using default" % token_val
+
+    return DEFAULT_PREF, "default"
+
+
+# ----------------------------------------------------------------------
+# xrandr parsing
+# ----------------------------------------------------------------------
+def parse_xrandr_query(text):
+    """Parse ``xrandr --query`` output into a list of output dicts.
+
+    Each dict: name, connected (bool), primary (bool), width, height, x, y
+    (None when the output is inactive), rotation, index, and ``modes``: list of
+    dicts with name, width, height, interlaced, current, preferred, rates.
+    Garbage / empty input yields an empty list.
+    """
+    outputs = []
+    current = None
+    if not text:
+        return outputs
+    for line in str(text).splitlines():
+        if not line.strip() or line.startswith("Screen "):
+            continue
+        if not line[0].isspace():
+            m = _HEADER_RE.match(line)
+            if not m:
+                current = None
+                continue
+            geom = m.group("w") is not None
+            current = {
+                "name": m.group("name"),
+                "connected": m.group("state") != "disconnected",
+                "primary": bool(m.group("primary")),
+                "width": int(m.group("w")) if geom else None,
+                "height": int(m.group("h")) if geom else None,
+                "x": int(m.group("x")) if geom else None,
+                "y": int(m.group("y")) if geom else None,
+                "rotation": m.group("rotation") or "normal",
+                "index": len(outputs),
+                "modes": [],
+            }
+            outputs.append(current)
+            continue
+        if current is None:
+            continue
+        m = _MODE_RE.match(line)
+        if not m:
+            continue
+        rates = []
+        is_current = False
+        is_preferred = False
+        for rm in _RATE_RE.finditer(m.group("rates")):
+            flags = rm.group(2)
+            rates.append(rm.group(1))
+            if "*" in flags:
+                is_current = True
+            if "+" in flags:
+                is_preferred = True
+        current["modes"].append({
+            "name": m.group("name"),
+            "width": int(m.group("w")),
+            "height": int(m.group("h")),
+            "interlaced": m.group("rest").startswith("i"),
+            "current": is_current,
+            "preferred": is_preferred,
+            "rates": rates,
+        })
+    return outputs
+
+
+def active_outputs(outputs):
+    """Connected outputs that currently drive a CRTC (have geometry)."""
+    return [o for o in outputs if o["connected"] and o["width"] and o["height"]]
+
+
+def current_mode_name(output):
+    for mode in output["modes"]:
+        if mode["current"]:
+            return mode["name"]
+    return None
+
+
+# ----------------------------------------------------------------------
+# Decision
+# ----------------------------------------------------------------------
+def within_cap(width, height, pref):
+    cap_w, cap_h = CAPS[pref]
+    # Ultrawide displays (21:9, 32:9) have readable 1080p/720p vertical text
+    # height at 2560x1080 / 3840x1080 / 2560x720; do not stretch them to 16:9.
+    if height > 0 and (float(width) / height) >= ASPECT_21_9_THRESHOLD:
+        return height <= cap_h
+    return width <= cap_w and height <= cap_h
+
+
+def _find_mode(output, width, height, allow_interlaced=False):
+    for mode in output["modes"]:
+        if mode["width"] == width and mode["height"] == height and (allow_interlaced or not mode["interlaced"]):
+            return mode
+    return None
+
+
+def compute_scale(width, height, pref=DEFAULT_PREF):
+    """Uniform Tier 2 zoom factor (<1 = magnify) for a too-large mode.
+
+    w >= 3200          -> 0.5 (exact 2x, 4K -> 1080p)
+    2400 <= w < 3200   -> round(1920 / w, 4) clamped to [0.5, 0.85]
+    otherwise          -> round(min(cap_w / w, cap_h / h), 4) clamped to
+                          [0.5, 0.85] (e.g. tall 1920x1440 panels)
+    """
+    if width >= 3200:
+        return 0.5
+    if width >= 2400:
+        s = round(1920.0 / width, 4)
+    else:
+        cap_w, cap_h = CAPS.get(pref, CAPS[DEFAULT_PREF])
+        s = round(min(float(cap_w) / width, float(cap_h) / height), 4)
+    return max(0.5, min(0.85, s))
+
+
+def choose_target_action(output, pref):
+    """Decide what to do for one output.  Returns an action dict or None.
+
+    Action: {"output", "kind": "mode"|"scale", "mode", "scale",
+             "logical": (w, h), "physical": (w, h)}
+    """
+    if pref not in CAPS:
+        return None
+    if not output.get("connected") or not output.get("width") or not output.get("height"):
+        return None
+    if output.get("rotation") in ("left", "right"):
+        return None  # header geometry is swapped vs. mode list; leave alone
+    w, h = output["width"], output["height"]
+    if within_cap(w, h, pref):
+        return None
+
+    aspect = float(w) / h
+    cap_w, cap_h = CAPS[pref]
+    if pref == PREF_720P:
+        if aspect >= ASPECT_32_9_THRESHOLD:
+            priority = PRIORITY_720P_32_9
+        elif aspect >= ASPECT_21_9_THRESHOLD:
+            priority = PRIORITY_720P_21_9
+        else:
+            priority = PRIORITY_720P
+    elif aspect >= ASPECT_32_9_THRESHOLD:
+        priority = PRIORITY_1080P_32_9
+    elif aspect >= ASPECT_21_9_THRESHOLD:
+        priority = PRIORITY_1080P_21_9
+    elif aspect < ASPECT_16_10_THRESHOLD:
+        priority = PRIORITY_1080P_16_10
+    else:
+        priority = PRIORITY_1080P_16_9
+
+    chosen = None
+    for pw, ph in priority:
+        if pw > w or ph > h:
+            continue  # never "downgrade" into a larger mode
+        chosen = _find_mode(output, pw, ph)
+        if chosen:
+            break
+
+    if chosen is None:
+        max_w = (
+            max(FALLBACK_MAX_W, int(round(cap_h * aspect * 1.15)))
+            if aspect >= ASPECT_21_9_THRESHOLD
+            else FALLBACK_MAX_W
+        )
+        candidates = [
+            m for m in output["modes"]
+            if FALLBACK_MIN_W <= m["width"] <= max_w
+            and FALLBACK_MIN_H <= m["height"] <= cap_h
+            and m["width"] <= w and m["height"] <= h
+        ]
+        if candidates:
+            candidates.sort(key=lambda m: (
+                m["interlaced"],
+                abs(float(m["width"]) / m["height"] - aspect) > 0.15,
+                -(m["width"] * m["height"]),
+                abs(float(m["width"]) / m["height"] - aspect),
+            ))
+            chosen = candidates[0]
+
+    if chosen is not None:
+        if chosen["width"] == w and chosen["height"] == h:
+            return None
+        return {
+            "output": output["name"],
+            "kind": "mode",
+            "mode": chosen["name"],
+            "scale": None,
+            "logical": (chosen["width"], chosen["height"]),
+            "physical": (w, h),
+        }
+    return make_scale_action(output, pref)
+
+
+def make_scale_action(output, pref=DEFAULT_PREF):
+    """Tier 2 action for an output (used directly and as Tier 1 fallback)."""
+    w, h = output["width"], output["height"]
+    s = compute_scale(w, h, pref)
+    return {
+        "output": output["name"],
+        "kind": "scale",
+        "mode": current_mode_name(output),
+        "scale": s,
+        "logical": (int(round(w * s)), int(round(h * s))),
+        "physical": (w, h),
+    }
+
+
+def plan_actions(outputs, pref):
+    """List of actions for every output that needs a change."""
+    actions = []
+    for output in active_outputs(outputs):
+        action = choose_target_action(output, pref)
+        if action is not None:
+            actions.append(action)
+    return actions
+
+
+def format_scale(s):
+    text = ("%.4f" % s).rstrip("0").rstrip(".")
+    return "%sx%s" % (text, text)
+
+
+def build_xrandr_commands(outputs, actions):
+    """Turn actions into argv lists (a single xrandr invocation).
+
+    With 2+ active outputs, every active output gets an explicit ``--pos``:
+    outputs are laid out left-to-right (original x order, then primary, then
+    xrandr order) using their new logical widths, all at y=0, so panels can
+    never overlap.  Returns [] when there is nothing to do.
+    """
+    if not actions:
+        return []
+    by_name = {a["output"]: a for a in actions}
+    active = active_outputs(outputs)
+    cmd = ["xrandr"]
+
+    def output_args(o):
+        args = ["--output", o["name"]]
+        a = by_name.get(o["name"])
+        if a is None:
+            return args
+        if a["kind"] == "mode":
+            args += ["--mode", a["mode"]]
+        else:
+            if a.get("mode"):
+                args += ["--mode", a["mode"]]
+            args += ["--scale", format_scale(a["scale"])]
+        return args
+
+    if len(active) >= 2:
+        ordered = sorted(active, key=lambda o: (o["x"], o["y"], not o["primary"], o["index"]))
+        positions = {(o["x"], o["y"]) for o in active}
+        if len(positions) == 1:
+            # Cloned/mirrored outputs: keep them mirrored at 0x0 instead of splitting into extend.
+            for o in ordered:
+                cmd += output_args(o) + ["--pos", "0x0"]
+        else:
+            x = 0
+            for o in ordered:
+                a = by_name.get(o["name"])
+                logical_w = a["logical"][0] if a else o["width"]
+                cmd += output_args(o) + ["--pos", "%dx0" % x]
+                x += logical_w
+    else:
+        for o in active:
+            if o["name"] in by_name:
+                cmd += output_args(o)
+    if len(cmd) == 1:
+        return []
+    return [cmd]
+
+
+def xrdb_dpi_for(actions):
+    """Tier 3 DPI from the widest physical mode; None if no bump needed."""
+    if not actions:
+        return None
+    max_w = max(a["physical"][0] for a in actions)
+    if max_w >= 3000:
+        return 192
+    if max_w >= 2400:
+        return 144
+    return None
+
+
+# ----------------------------------------------------------------------
+# Execution
+# ----------------------------------------------------------------------
+def default_runner(argv, input_text=None, timeout=SUBPROCESS_TIMEOUT):
+    """Run argv; return (returncode, stdout, stderr).  Never raises."""
+    try:
+        proc = subprocess.run(
+            argv,
+            input=input_text,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=timeout,
+        )
+        return proc.returncode, proc.stdout or "", proc.stderr or ""
+    except FileNotFoundError as e:
+        return 127, "", str(e)
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout after %ss" % timeout
+    except Exception as e:  # noqa: BLE001 - must never break login
+        return 1, "", "%s: %s" % (type(e).__name__, e)
+
+
+def dpi_state_path(environ=None):
+    """Private per-user state file read by /etc/X11/Xsession.d/35seekzilla-hidpi."""
+    env = os.environ if environ is None else environ
+    override = env.get("SEEKZILLA_DPI_STATE_FILE")
+    if override:
+        return override
+    runtime_dir = env.get("XDG_RUNTIME_DIR")
+    if runtime_dir and os.path.isdir(runtime_dir):
+        return os.path.join(runtime_dir, "seekzilla-xft-dpi")
+    return "/tmp/seekzilla-xft-dpi.%d" % os.getuid()
+
+
+def write_dpi_state_file(dpi, path=None):
+    """Atomically write ``Xft.dpi: <dpi>\\n`` to the per-user state file (mode 0600)."""
+    target = path if path is not None else dpi_state_path()
+    if not target or os.path.islink(target):
+        return False
+    parent = os.path.dirname(target) or "."
+    tmp_path = os.path.join(parent, ".seekzilla-xft-dpi.%d.tmp" % os.getpid())
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(tmp_path, flags, 0o600)
+        try:
+            os.write(fd, ("Xft.dpi: %d\n" % int(dpi)).encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.replace(tmp_path, target)
+        return True
+    except OSError:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return False
+
+
+def update_xresources_dpi(dpi, path=None):
+    """Best-effort update of ``Xft.dpi: <dpi>`` in ~/.Xresources when writable.
+
+    LightDM's ``lightdm-session`` merges ``~/.Xresources`` *after* ``~/.xprofile``.
+    In the live ISO, ``~/.Xresources`` may still be root-owned before ``rc-local``
+    runs ``chown``, so ``/etc/X11/Xsession.d/35seekzilla-hidpi`` (reading the
+    per-user state file from ``write_dpi_state_file``) is the primary guarantee
+    and this update is an extra safeguard. Refuses symlinks; returns True on write.
+    """
+    target = path if path is not None else os.path.expanduser("~/.Xresources")
+    if not target or os.path.islink(target):
+        return False
+    try:
+        if os.path.isfile(target):
+            with open(target, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.read().splitlines()
+        else:
+            lines = []
+        dpi_line = "Xft.dpi: %d" % int(dpi)
+        replaced = False
+        new_lines = []
+        for line in lines:
+            if re.match(r"^\s*Xft\.dpi\s*:", line):
+                if not replaced:
+                    new_lines.append(dpi_line)
+                    replaced = True
+            else:
+                new_lines.append(line)
+        if not replaced:
+            new_lines.append(dpi_line)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(target, flags, 0o644)
+        try:
+            os.write(fd, ("\n".join(new_lines) + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+        return True
+    except OSError:
+        return False
+
+
+def apply_display_mode(
+    pref,
+    runner=None,
+    log=None,
+    query_text=None,
+    dry_run=False,
+    xresources_path=None,
+    dpi_state_file=None,
+):
+    """Detect, plan and apply.  Returns a result dict; never raises.
+
+    result["status"]: "native" | "noop" | "mode" | "scale" | "xrdb" |
+                      "failed" | "no-xrandr" | "dry-run" | "error"
+    """
+    runner = runner or default_runner
+    log = log or (lambda msg: None)
+    result = {"pref": pref, "status": "error", "actions": [], "commands": []}
+    try:
+        if pref == PREF_NATIVE:
+            log("preference native: leaving displays untouched")
+            result["status"] = "native"
+            return result
+
+        if query_text is None:
+            rc, out, err = runner(["xrandr", "--query"])
+            if rc != 0:
+                log("xrandr --query failed (rc=%s): %s" % (rc, err.strip()))
+                result["status"] = "no-xrandr"
+                return result
+            query_text = out
+
+        outputs = parse_xrandr_query(query_text)
+        for o in outputs:
+            if o["connected"]:
+                log("found %s %s%s modes=%d" % (
+                    o["name"],
+                    "%dx%d+%d+%d" % (o["width"], o["height"], o["x"], o["y"]) if o["width"] else "inactive",
+                    " primary" if o["primary"] else "",
+                    len(o["modes"])))
+
+        actions = plan_actions(outputs, pref)
+        result["actions"] = actions
+        if not actions:
+            log("all outputs within %s cap: no change" % pref)
+            result["status"] = "noop"
+            return result
+
+        commands = build_xrandr_commands(outputs, actions)
+        result["commands"] = list(commands)
+        if dry_run:
+            for cmd in commands:
+                log("dry-run: %s" % " ".join(cmd))
+            result["status"] = "dry-run"
+            return result
+
+        # Tier 1 (and Tier 2 for single-mode panels) as planned.
+        if _run_all(commands, runner, log):
+            result["status"] = "scale" if all(a["kind"] == "scale" for a in actions) else "mode"
+            return result
+
+        # Tier 2: retry every changed output with --scale instead of --mode.
+        names = {a["output"] for a in actions}
+        if any(a["kind"] == "mode" for a in actions):
+            scale_actions = [make_scale_action(o, pref) for o in active_outputs(outputs) if o["name"] in names]
+            scale_cmds = build_xrandr_commands(outputs, scale_actions)
+            result["commands"] += scale_cmds
+            if _run_all(scale_cmds, runner, log):
+                result["actions"] = scale_actions
+                result["status"] = "scale"
+                return result
+
+        # Tier 3: font DPI via xrdb.
+        dpi = xrdb_dpi_for(actions)
+        if dpi is None:
+            log("xrandr failed and no DPI fallback applies")
+            result["status"] = "failed"
+            return result
+        argv = ["xrdb", "-merge"]
+        result["commands"].append(argv)
+        rc, _out, err = runner(argv, input_text="Xft.dpi: %d\n" % dpi)
+        if rc == 0:
+            state_written = write_dpi_state_file(dpi, path=dpi_state_file)
+            xr_updated = update_xresources_dpi(dpi, path=xresources_path)
+            log(
+                "xrdb -merge Xft.dpi: %d applied (dpi_state=%s xresources_updated=%s)"
+                % (dpi, state_written, xr_updated)
+            )
+            result["status"] = "xrdb"
+            result["dpi"] = dpi
+            result["dpi_state_written"] = state_written
+            result["xresources_updated"] = xr_updated
+        else:
+            log("xrdb -merge failed (rc=%s): %s" % (rc, err.strip()))
+            result["status"] = "failed"
+        return result
+    except Exception as e:  # noqa: BLE001 - must never break login
+        log("unexpected error: %s: %s" % (type(e).__name__, e))
+        result["status"] = "error"
+        return result
+
+
+def _run_all(commands, runner, log):
+    for cmd in commands:
+        rc, _out, err = runner(cmd)
+        log("ran: %s -> rc=%s%s" % (" ".join(cmd), rc, (" " + err.strip()) if err.strip() else ""))
+        if rc != 0:
+            return False
+    return True
+
+
+# ----------------------------------------------------------------------
+# CLI
+# ----------------------------------------------------------------------
+def make_file_logger(path=None, echo=False):
+    path = path or os.environ.get("SEEKZILLA_DISPLAY_LOG") or LOG_PATH
+
+    def log(msg):
+        line = "%s seekzilla-set-display-mode: %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
+        if echo:
+            print(line)
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+    return log
+
+
+USAGE = """usage: seekzilla-set-display-mode [--dry-run] [--check] [--xrandr-file FILE] [--mode native|720p|1080p]
+
+  (no args)          detect and apply; always exits 0
+  --dry-run          print the planned xrandr command, change nothing; exits 0
+  --check            like --dry-run, but exit 1 if a change would be made
+  --xrandr-file F    read `xrandr --query` output from F (implies --dry-run)
+  --mode M           override the preference (beats env and /proc/cmdline)
+"""
+
+
+def main(argv=None, runner=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    check = False
+    dry_run = False
+    query_file = None
+    mode_override = None
+    try:
+        i = 0
+        while i < len(argv):
+            arg = argv[i]
+            if arg in ("-h", "--help"):
+                print(USAGE, end="")
+                return 0
+            elif arg == "--check":
+                check = dry_run = True
+            elif arg == "--dry-run":
+                dry_run = True
+            elif arg == "--xrandr-file" and i + 1 < len(argv):
+                i += 1
+                query_file = argv[i]
+                dry_run = True
+            elif arg == "--mode" and i + 1 < len(argv):
+                i += 1
+                mode_override = argv[i]
+            else:
+                print("seekzilla-set-display-mode: ignoring unknown argument %r" % arg, file=sys.stderr)
+            i += 1
+
+        log = make_file_logger(echo=dry_run)
+        if mode_override is not None:
+            pref = normalize_preference(mode_override) or DEFAULT_PREF
+            source = "--mode %s" % mode_override
+        else:
+            pref, source = read_display_preference()
+        log("preference %s (%s)" % (pref, source))
+
+        query_text = None
+        if query_file is not None:
+            with open(query_file, "r", encoding="utf-8", errors="replace") as f:
+                query_text = f.read()
+
+        result = apply_display_mode(pref, runner=runner, log=log, query_text=query_text, dry_run=dry_run)
+        log("result: %s" % result["status"])
+        if check:
+            return 1 if result["actions"] else 0
+        return 0
+    except BaseException as e:  # noqa: BLE001 - must never break login
+        if isinstance(e, SystemExit) and not check:
+            return 0
+        try:
+            make_file_logger()("fatal: %s: %s" % (type(e).__name__, e))
+        except Exception:  # noqa: BLE001
+            pass
+        return 2 if check else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
